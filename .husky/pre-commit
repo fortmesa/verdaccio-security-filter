@@ -1,1 +1,5 @@
+yarn install --immutable || {
+  echo "yarn.lock is out of date with package.json -- run 'yarn install' and commit the result." >&2
+  exit 1
+}
 yarn lint-staged

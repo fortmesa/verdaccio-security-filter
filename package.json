@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/verdaccio-security-filter",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Verdaccio filter plugin: blocks versions that are too new, published after a date threshold, match a synced OSV malicious-package blocklist, match a manual block/allow list, or newly introduce install scripts, and (optionally, as a middlewares plugin) rejects publishing such versions outright",
   "license": "MIT",
   "repository": "fortmesa/verdaccio-security-filter",
