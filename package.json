@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/verdaccio-security-filter",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Verdaccio filter plugin: blocks versions that are too new, published after a date threshold, match a synced OSV malicious-package blocklist, match a manual block/allow list, or newly introduce install scripts, and (optionally, as a middlewares plugin) rejects publishing such versions outright",
   "license": "MIT",
   "repository": "fortmesa/verdaccio-security-filter",
@@ -43,8 +43,8 @@
     "yauzl": "^3.1.0"
   },
   "peerDependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1075.0",
-    "@aws-sdk/lib-dynamodb": "^3.1075.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
     "ioredis": "^5.4.1"
   },
   "peerDependenciesMeta": {
