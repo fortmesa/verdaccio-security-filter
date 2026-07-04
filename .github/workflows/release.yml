@@ -10,7 +10,7 @@ jobs:
     name: Test
     runs-on: ubuntu-slim
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Enable corepack
         run: corepack enable
@@ -29,7 +29,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Enable corepack
         run: corepack enable
@@ -61,6 +61,7 @@ jobs:
         run: |
           set -eu
           yarn config set 'npmScopes.fortmesa.npmRegistryServer' 'https://npmjs.dev.fort.blue'
+          yarn config set 'npmScopes.fortmesa.npmPublishRegistry' 'https://npmjs.dev.fort.blue'
           yarn config set 'npmScopes.fortmesa.npmAlwaysAuth' true
           yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
 
@@ -74,7 +75,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Enable corepack
         run: corepack enable
