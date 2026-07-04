@@ -329,7 +329,7 @@ class SecurityFilter {
       // scriptIntroductionIsRecent ensures packages like esbuild (scripts added years ago) are never blocked.
       if (isScripted && seenCleanVersion && scriptIntroductionIsRecent) {
         blocked.add(ver);
-        this.logger.warn(
+        this.logger.error(
           {pkg: packageInfo.name, ver, scripts: installScriptKeys},
           'security-filter: blocked -- install scripts newly introduced in this version',
         );
@@ -491,7 +491,7 @@ class SecurityFilter {
 
             const osvHit = this.maliciousPackageStore?.check(packageName, ver);
             if (osvHit && osvHit.type === 'cve') {
-              this.logger.error(
+              this.logger.fatal(
                 {
                   pkg: packageName,
                   ver,
@@ -527,7 +527,7 @@ class SecurityFilter {
                 .json({error: 'forbidden', reason: cveReason});
             }
             if (osvHit) {
-              this.logger.error(
+              this.logger.fatal(
                 {pkg: packageName, ver, user, malIds: osvHit.malIds},
                 'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} matches known-malicious-package ' +
                   'advisory [@{malIds}] (OSV) -- rejected',
@@ -560,7 +560,7 @@ class SecurityFilter {
             );
             if (matchedBlockRules.length > 0) {
               const rule = matchedBlockRules.map(describeRule).join(', ');
-              this.logger.error(
+              this.logger.fatal(
                 {pkg: packageName, ver, user, rule},
                 'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} matches manual block rule ' +
                   '[@{rule}] -- rejected',
@@ -604,7 +604,7 @@ class SecurityFilter {
           scripts.map(s => [s, incomingVersions[offendingVersion].scripts[s]]),
         );
 
-        this.logger.error(
+        this.logger.fatal(
           {pkg: packageName, ver: offendingVersion, user, scripts, commands},
           'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} introduces install script(s) ' +
             '[@{scripts}] not present in any previously published version -- rejected as a likely ' +

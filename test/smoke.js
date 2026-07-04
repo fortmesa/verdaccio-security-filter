@@ -12,17 +12,18 @@ const http = require('node:http');
 const assert = require('node:assert/strict');
 const {SecurityFilter} = require('../index.js');
 
-const NOOP_LOGGER = {warn() {}, error() {}, info() {}};
+const NOOP_LOGGER = {warn() {}, error() {}, info() {}, fatal() {}};
 
 // Records every warn()/error() call's arguments so a test can assert on the
 // exact fields logged, not just on the resulting block/reject decision --
 // needed to confirm the CVE-vs-MAL log branch actually carries the right
 // distinct fields (cveId/severity/cweIds vs malIds), not just "something".
 function makeCapturingLogger() {
-  const calls = {warn: [], error: []};
+  const calls = {warn: [], error: [], fatal: []};
   return {
     warn: (...args) => calls.warn.push(args),
     error: (...args) => calls.error.push(args),
+    fatal: (...args) => calls.fatal.push(args),
     info() {},
     calls,
   };
@@ -645,8 +646,8 @@ async function main() {
         assert.equal(status, 403);
         assert.match(body.reason, /CVE-2025-1/);
         assert.match(body.reason, /CRITICAL/);
-        assert.equal(logger.calls.error.length, 1);
-        const [fields] = logger.calls.error[0];
+        assert.equal(logger.calls.fatal.length, 1);
+        const [fields] = logger.calls.fatal[0];
         assert.equal(fields.cveId, 'CVE-2025-1');
         assert.equal(
           fields.malIds,

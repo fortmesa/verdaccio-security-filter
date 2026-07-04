@@ -10,7 +10,7 @@ const http = require('node:http');
 const assert = require('node:assert/strict');
 const {SecurityFilter} = require('../index.js');
 
-const NOOP_LOGGER = {warn() {}, error() {}, info() {}};
+const NOOP_LOGGER = {warn() {}, error() {}, info() {}, fatal() {}};
 
 function makeCapturingLogger() {
   const calls = {warn: [], error: []};

@@ -30,13 +30,14 @@ const {
 } = require('../malicious-packages.js');
 const {createDynamoDbStore} = require('../dynamodb-store.js');
 
-const NOOP_LOGGER = {warn() {}, error() {}, info() {}};
+const NOOP_LOGGER = {warn() {}, error() {}, info() {}, fatal() {}};
 
 function makeCapturingLogger() {
-  const calls = {warn: [], error: []};
+  const calls = {warn: [], error: [], fatal: []};
   return {
     warn: (...args) => calls.warn.push(args),
     error: (...args) => calls.error.push(args),
+    fatal: (...args) => calls.fatal.push(args),
     info() {},
     calls,
   };
@@ -642,11 +643,11 @@ async function main() {
         await store.runSyncCycle();
 
         assert.equal(
-          logger.calls.error.length,
+          logger.calls.fatal.length,
           1,
           'exactly one cached version (1.0.0) should have triggered the alert',
         );
-        const [fields, message] = logger.calls.error[0];
+        const [fields, message] = logger.calls.fatal[0];
         assert.equal(fields.pkg, 'newly-flagged');
         assert.equal(fields.ver, '1.0.0');
         assert.match(message, /CACHED PACKAGE NOW FLAGGED/);
@@ -698,7 +699,7 @@ async function main() {
           'bootstrap should still apply the block itself',
         );
         assert.equal(
-          logger.calls.error.length,
+          logger.calls.fatal.length,
           0,
           'bootstrap must not fire the retroactive alert -- it is a one-time historical load, not "new" OSV data',
         );

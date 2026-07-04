@@ -213,7 +213,7 @@ next time some client happens to request that exact package again. On top of it,
 every **incremental** sync cycle (not bootstrap -- see below) also proactively
 cross-references each newly-applied delta against whatever this registry
 actually has cached/stored locally, right as the delta is ingested. A match logs
-the loud, `error`-level `!!! CACHED PACKAGE NOW FLAGGED !!!` line (see "Logging"
+the loud, `fatal`-level `!!! CACHED PACKAGE NOW FLAGGED !!!` line (see "Logging"
 below) and fires the configured `webhook:` (see "Webhooks" below) immediately,
 rather than waiting on a coincidental future read to surface it. This requires
 the plugin to also be listed under `middlewares:` (with at least an empty block,
@@ -552,7 +552,7 @@ logs at `warn`; a `304`/nothing-changed poll cycle logs nothing at all, since
 it's the expected common case every poll interval and would otherwise be pure
 noise.
 
-A publish-time rejection is deliberately louder: it logs at **`error`** (not
+A publish-time rejection is deliberately louder: it logs at **`fatal`** (not
 `warn`) with a `security-filter: !!! BLOCKED PUBLISH !!! ...` line, including
 the package, version, publishing user, and either the offending script
 command(s) or the matched OSV advisory id(s)/block rule, for immediate forensic
@@ -563,7 +563,7 @@ sync also logs at `error`, for the ordinary reason: it's an unexpected failure,
 not an active-attempt exception.
 
 The OSV-sync retroactive alert (see "Malicious-package blocklist (OSV)") is
-equally loud, at `error` with a
+equally loud, at `fatal` with a
 `security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! ...` line -- distinct
 wording from `BLOCKED PUBLISH` since nothing was actually published or actively
 rejected at that moment; this is a passive discovery, not a live attempt, but no

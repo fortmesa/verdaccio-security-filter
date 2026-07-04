@@ -388,7 +388,7 @@ class MaliciousPackageStore {
     this._timer = setTimeout(() => {
       this.runSyncCycle()
         .catch(err =>
-          this.logger.error(
+          this.logger.warn(
             {err: err.message},
             'security-filter: osv -- sync cycle failed',
           ),
@@ -460,7 +460,7 @@ class MaliciousPackageStore {
         }
       }
     } catch (err) {
-      this.logger.error(
+      this.logger.warn(
         {err: err.message},
         'security-filter: osv -- bootstrap failed, will retry',
       );
@@ -496,7 +496,7 @@ class MaliciousPackageStore {
         }
       }
     } catch (err) {
-      this.logger.error(
+      this.logger.warn(
         {err: err.message},
         'security-filter: osv -- failed to seed modified_id.csv state after bootstrap',
       );
@@ -514,7 +514,7 @@ class MaliciousPackageStore {
         'security-filter: osv -- bootstrap completed with unwritten entries, @{failedCount} of @{count} failed',
       );
     } else {
-      this.logger.warn(
+      this.logger.info(
         {count},
         'security-filter: osv -- bootstrap completed, @{count} entries loaded',
       );
@@ -536,7 +536,7 @@ class MaliciousPackageStore {
         timeoutMs: this.requestTimeoutMs,
       });
     } catch (err) {
-      this.logger.error(
+      this.logger.warn(
         {err: err.message},
         'security-filter: osv -- failed to check modified_id.csv, will retry next cycle',
       );
@@ -595,7 +595,7 @@ class MaliciousPackageStore {
             allApplied = false;
             continue;
           }
-          this.logger.warn(
+          this.logger.info(
             isMal
               ? {pkg: pkg.name, malIds: [record.id]}
               : {
@@ -706,7 +706,7 @@ class MaliciousPackageStore {
               `SECURITY ALERT: ${pkgName}@${ver}, already cached in this registry, now matches known ` +
               `vulnerability ${cveId ?? delta.cveEntry.id} (${severity ?? 'unknown severity'}` +
               `${cweIds?.length ? ', ' + cweIds.join(', ') : ''}) from OSV.`;
-            this.logger.error(
+            this.logger.fatal(
               {pkg: pkgName, ver, cveId, severity, cweIds},
               'security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! @{pkg}@@{ver} matches known vulnerability ' +
                 '@{cveId} [@{severity}, @{cweIds}] (OSV) -- already in local storage',
@@ -733,7 +733,7 @@ class MaliciousPackageStore {
             const reason =
               `SECURITY ALERT: ${pkgName}@${ver}, already cached in this registry, now matches known-` +
               `malicious-package advisory (${delta.malIds.join(', ')}) from OSV.`;
-            this.logger.error(
+            this.logger.fatal(
               {pkg: pkgName, ver, malIds: delta.malIds},
               'security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! @{pkg}@@{ver} matches known-malicious-' +
                 'package advisory [@{malIds}] (OSV) -- already in local storage',
@@ -788,7 +788,7 @@ class MaliciousPackageStore {
       if (entry.malIds === undefined && entry.cves === undefined) {
         await this.store.deleteItem(pkgName);
         this._blocklist.delete(pkgName);
-        this.logger.warn(
+        this.logger.info(
           {pkg: pkgName, id},
           'security-filter: osv -- advisory withdrawn, @{pkg} removed from blocklist',
         );
@@ -799,7 +799,7 @@ class MaliciousPackageStore {
           modified: new Date().toISOString(),
         };
         await this.store.putItem(item);
-        this.logger.warn(
+        this.logger.info(
           {pkg: pkgName, id},
           'security-filter: osv -- advisory withdrawn, removed from @{pkg} (other advisories remain)',
         );
