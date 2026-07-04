@@ -23,6 +23,7 @@
 
 const semver = require('semver');
 const osvClient = require('./osv-client');
+const {sendWebhook} = require('./webhook');
 
 const SYNC_STATE_KEY = '__sync_state__'; // safe: npm forbids package names starting with '_'
 const KNOWN_SEVERITIES = new Set(['LOW', 'MODERATE', 'HIGH', 'CRITICAL']);
@@ -143,6 +144,21 @@ class MaliciousPackageStore {
     this._blocklist = new Map(); // packageName -> { ranges, malIds, originCount, sources, cves }
     this._timer = null;
 
+    // Fired when an incremental sync's newly-applied delta matches a
+    // version this registry already has cached/stored locally -- see
+    // _checkAgainstLocalStorage() below. Same single, static webhook target
+    // index.js's publish-time gate uses (threaded through by whichever
+    // plugin instance constructs this singleton first -- see index.js's
+    // getAdvisoryStore() call).
+    this.webhookConfig = options.webhookConfig ?? null;
+    // Only set once this plugin is ALSO configured under `middlewares:` (see
+    // index.js's register_middlewares(), the only Verdaccio hook that
+    // actually receives a `storage` reference) -- null until then, which
+    // _checkAgainstLocalStorage() treats as "nothing to check against yet"
+    // rather than an error: the passive read-path filter still catches these
+    // cases regardless, this is only the proactive notification on top.
+    this.registryStorage = null;
+
     // MAL confidence filters and CVE (GHSA) blocking config -- validated
     // unconditionally, even if osv.enabled is still false, so a config
     // mistake (e.g. a severity typo) fails loud immediately rather than
@@ -201,6 +217,15 @@ class MaliciousPackageStore {
       .finally(() => {
         if (this._autoSchedule) this._scheduleNext();
       });
+  }
+
+  // Called from index.js's register_middlewares() -- the only Verdaccio
+  // hook that actually receives a `storage` reference. Idempotent/last-
+  // writer-wins on purpose: harmless if called more than once (e.g. by a
+  // pod restart) or never at all (retroactive checking below just stays
+  // inert; nothing else depends on this).
+  attachRegistryStorage(storage) {
+    this.registryStorage = storage;
   }
 
   // Loads the requested backend module. filesystem-store.js has zero
@@ -640,7 +665,94 @@ class MaliciousPackageStore {
     const unwritten = await this.store.putItems([merged]);
     if (unwritten.length > 0) return false;
     this._applyToMemory(merged);
+    this._checkAgainstLocalStorage(pkgName, delta);
     return true;
+  }
+
+  // Cross-references a just-applied incremental delta (NOT the package's
+  // whole merged entry -- a pre-existing entry that already matched a
+  // cached version would already have been notified about on some earlier
+  // cycle, when that entry was itself the delta) against whatever this
+  // registry actually has cached/stored locally, so a genuinely new match
+  // is noticed and alerted on immediately rather than silently waiting for
+  // some future client to coincidentally request that exact package again
+  // (which is the only thing that would otherwise surface it, via the
+  // ordinary, quiet filter_metadata() path in index.js).
+  //
+  // Deliberately NOT called from _runBootstrap(): that's a one-time,
+  // whole-history initial load (the entire OSV feed, potentially thousands
+  // of entries) -- treating every entry as "new" there would mean a flood
+  // of alerts on a fresh pod's first boot for advisories that predate this
+  // registry ever caching anything, which is noise, not signal. Steady-
+  // state incremental syncs are where "new OSV data" genuinely means new.
+  _checkAgainstLocalStorage(pkgName, delta) {
+    if (!this.registryStorage) return; // not attached yet -- see attachRegistryStorage()
+
+    this.registryStorage.getPackage({
+      name: pkgName,
+      uplinksLook: false, // local storage only -- never triggers an uplink fetch
+      callback: (err, pkg) => {
+        if (err || !pkg?.versions) return; // not cached locally -- nothing to alert on
+
+        for (const ver of Object.keys(pkg.versions)) {
+          if (delta.cveEntry) {
+            if (
+              !this._cveVersionAffected(ver, delta.cveEntry) ||
+              !this._cveMatchesFilters(delta.cveEntry)
+            )
+              continue;
+            const {cveId, severity, cweIds} = delta.cveEntry;
+            const reason =
+              `SECURITY ALERT: ${pkgName}@${ver}, already cached in this registry, now matches known ` +
+              `vulnerability ${cveId ?? delta.cveEntry.id} (${severity ?? 'unknown severity'}` +
+              `${cweIds?.length ? ', ' + cweIds.join(', ') : ''}) from OSV.`;
+            this.logger.error(
+              {pkg: pkgName, ver, cveId, severity, cweIds},
+              'security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! @{pkg}@@{ver} matches known vulnerability ' +
+                '@{cveId} [@{severity}, @{cweIds}] (OSV) -- already in local storage',
+            );
+            sendWebhook(
+              this.webhookConfig,
+              {
+                event: 'osv_retroactive_cve',
+                pkg: pkgName,
+                ver,
+                cveId,
+                severity,
+                cweIds: (cweIds ?? []).join(', '),
+                reason,
+              },
+              this.logger,
+            );
+          } else {
+            if (
+              !versionMatchesRanges(ver, delta.ranges ?? []) ||
+              !this._malPassesConfidenceFilters(delta)
+            )
+              continue;
+            const reason =
+              `SECURITY ALERT: ${pkgName}@${ver}, already cached in this registry, now matches known-` +
+              `malicious-package advisory (${delta.malIds.join(', ')}) from OSV.`;
+            this.logger.error(
+              {pkg: pkgName, ver, malIds: delta.malIds},
+              'security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! @{pkg}@@{ver} matches known-malicious-' +
+                'package advisory [@{malIds}] (OSV) -- already in local storage',
+            );
+            sendWebhook(
+              this.webhookConfig,
+              {
+                event: 'osv_retroactive_mal',
+                pkg: pkgName,
+                ver,
+                malIds: delta.malIds.join(', '),
+                reason,
+              },
+              this.logger,
+            );
+          }
+        }
+      },
+    });
   }
 
   // Conservative/safe-not-precise by design: if the withdrawn advisory was

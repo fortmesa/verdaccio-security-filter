@@ -3,6 +3,13 @@
 const semver = require('semver');
 const bodyParser = require('body-parser');
 const {getAdvisoryStore} = require('./malicious-packages');
+const {sendWebhook} = require('./webhook');
+
+// Must match this package's name: Verdaccio's plugin loader resolves a
+// scoped package name verbatim as the config key (no `verdaccio-` prefix
+// mangling), and both the `filters:` and `middlewares:` sections need to
+// agree on this key for the shared-config lookup below to find each other.
+const PLUGIN_CONFIG_KEY = '@fortmesa/verdaccio-security-filter';
 
 // Scripts that execute when a package is installed as a registry dependency.
 // prepare/prepack/postpack only run locally or during publish, not on npm install.
@@ -134,28 +141,46 @@ class SecurityFilter {
         ? Date.parse(packageAge.thresholdDate)
         : null;
 
-    // Manual block:/allow: lists. filters: security-filter: and
-    // middlewares: security-filter: are two independent plugin instances
-    // (Verdaccio's loader instantiates each config-section entry
-    // separately) -- read from the canonical filters: section of the
-    // *full* app config (the same pattern max_body_size below already
-    // uses) so both instances agree on one rule set without operators
-    // needing to duplicate block/allow under both sections. Falls back to
-    // this instance's own config for the test harness, which passes a bare
-    // `config: {}` as options.config.
-    const sharedConfig = options.config?.filters?.['security-filter'] ?? config;
+    // Manual block:/allow: lists. filters: "@fortmesa/verdaccio-security-filter":
+    // and middlewares: "@fortmesa/verdaccio-security-filter": are two
+    // independent plugin instances (Verdaccio's loader instantiates each
+    // config-section entry separately) -- read from the canonical filters:
+    // section of the *full* app config (the same pattern max_body_size below
+    // already uses) so both instances agree on one rule set without
+    // operators needing to duplicate block/allow under both sections. Falls
+    // back to this instance's own config for the test harness, which passes
+    // a bare `config: {}` as options.config. Must be the literal, scoped
+    // package name -- Verdaccio's config key for a scoped plugin is never
+    // prefix-mangled, so a bare 'security-filter' here would never match a
+    // real deployment's actual filters: key and always silently fall
+    // through to `?? config` instead.
+    const sharedConfig = options.config?.filters?.[PLUGIN_CONFIG_KEY] ?? config;
     this.blockRules = compileRules(sharedConfig.block ?? [], 'block');
     this.allowRules = compileRules(sharedConfig.allow ?? [], 'allow');
+
+    // Single, static, operator-configured webhook target -- fired for every
+    // "loud" security event (publish-time gate rejections, and OSV sync
+    // discovering an already-cached package now matches new MAL/CVE data).
+    // See docs/configuration.md's "Webhooks" section and webhook.js.
+    this.webhookConfig = sharedConfig.webhook ?? null;
+    if (this.webhookConfig && !this.webhookConfig.url) {
+      throw new Error('security-filter: webhook is configured but has no url');
+    }
 
     // OSV malicious-package blocklist -- see malicious-packages.js. The
     // store is a singleton shared by both plugin instances in this
     // process; getAdvisoryStore() is an inert no-op factory unless
     // osv.enabled is set. options.maliciousPackageStore lets tests inject
-    // a fake store without touching the real singleton.
+    // a fake store without touching the real singleton. webhookConfig is
+    // threaded through so the sync loop's own retroactive-match check (see
+    // malicious-packages.js) can fire the same webhook this instance would.
     this.osvBlockStrategy = config.osv?.blockStrategy ?? 'remove';
     this.maliciousPackageStore =
       options.maliciousPackageStore ??
-      getAdvisoryStore(sharedConfig.osv ?? {}, options);
+      getAdvisoryStore(sharedConfig.osv ?? {}, {
+        ...options,
+        webhookConfig: this.webhookConfig,
+      });
 
     // Publish-time gates -- see register_middlewares() below. Only active
     // when this plugin is also listed under `middlewares:` in config.yaml;
@@ -392,6 +417,13 @@ class SecurityFilter {
   // config.yaml with at least one of the two flags set true -- the
   // `filters:` role above is independent and unaffected either way.
   register_middlewares(app, auth, storage) {
+    // Unconditional, regardless of the two flags below: this is the only
+    // Verdaccio hook that ever receives a `storage` reference, and the OSV
+    // singleton's own retroactive-match check (see malicious-packages.js's
+    // _checkAgainstLocalStorage()) needs it independently of whether the
+    // publish-time reject gates are also enabled here.
+    this.maliciousPackageStore?.attachRegistryStorage?.(storage);
+
     if (!this.blockPublishWithNewScripts && !this.blockPublishMatches) return;
 
     app.use((req, res, next) => {
@@ -471,14 +503,28 @@ class SecurityFilter {
                 'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} matches known vulnerability ' +
                   '@{cveId} [@{severity}, @{cweIds}] (OSV) -- rejected',
               );
-              return res.status(403).json({
-                error: 'forbidden',
-                reason:
-                  `SECURITY BLOCK: publish of ${packageName}@${ver} rejected -- matches known vulnerability ` +
-                  `${osvHit.cveId ?? osvHit.ids.join(', ')} (${osvHit.severity ?? 'unknown severity'}` +
-                  `${osvHit.cweIds?.length ? ', ' + osvHit.cweIds.join(', ') : ''}) from OSV. Contact a registry ` +
-                  'administrator if this is a false positive.',
-              });
+              const cveReason =
+                `SECURITY BLOCK: publish of ${packageName}@${ver} rejected -- matches known vulnerability ` +
+                `${osvHit.cveId ?? osvHit.ids.join(', ')} (${osvHit.severity ?? 'unknown severity'}` +
+                `${osvHit.cweIds?.length ? ', ' + osvHit.cweIds.join(', ') : ''}) from OSV. Contact a registry ` +
+                'administrator if this is a false positive.';
+              sendWebhook(
+                this.webhookConfig,
+                {
+                  event: 'publish_blocked_cve',
+                  pkg: packageName,
+                  ver,
+                  user,
+                  cveId: osvHit.cveId,
+                  severity: osvHit.severity,
+                  cweIds: (osvHit.cweIds ?? []).join(', '),
+                  reason: cveReason,
+                },
+                this.logger,
+              );
+              return res
+                .status(403)
+                .json({error: 'forbidden', reason: cveReason});
             }
             if (osvHit) {
               this.logger.error(
@@ -486,13 +532,25 @@ class SecurityFilter {
                 'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} matches known-malicious-package ' +
                   'advisory [@{malIds}] (OSV) -- rejected',
               );
-              return res.status(403).json({
-                error: 'forbidden',
-                reason:
-                  `SECURITY BLOCK: publish of ${packageName}@${ver} rejected -- matches a known-malicious-package ` +
-                  `advisory (${osvHit.malIds.join(', ')}) from OSV. Contact a registry administrator if this is a ` +
-                  'false positive.',
-              });
+              const malReason =
+                `SECURITY BLOCK: publish of ${packageName}@${ver} rejected -- matches a known-malicious-package ` +
+                `advisory (${osvHit.malIds.join(', ')}) from OSV. Contact a registry administrator if this is a ` +
+                'false positive.';
+              sendWebhook(
+                this.webhookConfig,
+                {
+                  event: 'publish_blocked_mal',
+                  pkg: packageName,
+                  ver,
+                  user,
+                  malIds: osvHit.malIds.join(', '),
+                  reason: malReason,
+                },
+                this.logger,
+              );
+              return res
+                .status(403)
+                .json({error: 'forbidden', reason: malReason});
             }
 
             const matchedBlockRules = findMatchingRules(
@@ -507,10 +565,22 @@ class SecurityFilter {
                 'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} matches manual block rule ' +
                   '[@{rule}] -- rejected',
               );
-              return res.status(403).json({
-                error: 'forbidden',
-                reason: `SECURITY BLOCK: publish of ${packageName}@${ver} rejected -- matches manual block rule (${rule}).`,
-              });
+              const ruleReason = `SECURITY BLOCK: publish of ${packageName}@${ver} rejected -- matches manual block rule (${rule}).`;
+              sendWebhook(
+                this.webhookConfig,
+                {
+                  event: 'publish_blocked_rule',
+                  pkg: packageName,
+                  ver,
+                  user,
+                  rule,
+                  reason: ruleReason,
+                },
+                this.logger,
+              );
+              return res
+                .status(403)
+                .json({error: 'forbidden', reason: ruleReason});
             }
           }
         }
@@ -541,14 +611,25 @@ class SecurityFilter {
             'supply-chain compromise pattern',
         );
 
-        res.status(403).json({
-          error: 'forbidden',
-          reason:
-            `SECURITY BLOCK: publish of ${packageName}@${offendingVersion} rejected -- it introduces install ` +
-            `script(s) [${scripts.join(', ')}] that no previously published version of this package had. This ` +
-            'is blocked as a likely supply-chain compromise pattern. Contact a registry administrator if this ' +
-            'script is intentional.',
-        });
+        const scriptReason =
+          `SECURITY BLOCK: publish of ${packageName}@${offendingVersion} rejected -- it introduces install ` +
+          `script(s) [${scripts.join(', ')}] that no previously published version of this package had. This ` +
+          'is blocked as a likely supply-chain compromise pattern. Contact a registry administrator if this ' +
+          'script is intentional.';
+        sendWebhook(
+          this.webhookConfig,
+          {
+            event: 'publish_blocked_script',
+            pkg: packageName,
+            ver: offendingVersion,
+            user,
+            scripts: scripts.join(', '),
+            reason: scriptReason,
+          },
+          this.logger,
+        );
+
+        res.status(403).json({error: 'forbidden', reason: scriptReason});
       },
     });
   }

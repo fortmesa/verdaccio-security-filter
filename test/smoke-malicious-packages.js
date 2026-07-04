@@ -32,6 +32,63 @@ const {createDynamoDbStore} = require('../dynamodb-store.js');
 
 const NOOP_LOGGER = {warn() {}, error() {}, info() {}};
 
+function makeCapturingLogger() {
+  const calls = {warn: [], error: []};
+  return {
+    warn: (...args) => calls.warn.push(args),
+    error: (...args) => calls.error.push(args),
+    info() {},
+    calls,
+  };
+}
+
+// Minimal Storage#getPackage stand-in -- same shape test/smoke.js and
+// test/smoke-webhook.js use, just under the name this file's own tests
+// reach for.
+function makeFakeRegistryStorage() {
+  const existingByName = new Map();
+  return {
+    setExisting(name, versions) {
+      existingByName.set(name, {versions});
+    },
+    getPackage({name, callback}) {
+      const existing = existingByName.get(name);
+      if (!existing) return callback({status: 404}, null);
+      callback(null, existing);
+    },
+  };
+}
+
+// Same webhook-receiver stand-in as test/smoke-webhook.js.
+async function startWebhookReceiver() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => (body += chunk));
+    req.on('end', () => {
+      requests.push({method: req.method, path: req.url, body});
+      res.statusCode = 200;
+      res.end('ok');
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const {port} = server.address();
+  return {
+    url: `http://127.0.0.1:${port}`,
+    requests,
+    close: () => new Promise(resolve => server.close(resolve)),
+  };
+}
+
+async function waitFor(predicate, {timeoutMs = 2000, intervalMs = 10} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+  throw new Error('waitFor: condition never became true');
+}
+
 // `origins` mimics database_specific['malicious-packages-origins'] --
 // defaults to a single origin (the most common real-world case: 155,429 of
 // 215,113 live npm MAL records have exactly one) so existing tests that
@@ -309,7 +366,7 @@ async function bootstrapStore(store) {
   await store.runSyncCycle();
 }
 
-function makeStore(config, docClient) {
+function makeStore(config, docClient, optionsOverrides = {}) {
   _resetSharedStoreForTests(); // each test constructs its own store directly, not via the shared singleton
   return new MaliciousPackageStore(
     {enabled: true, dynamo: {tableName: 'test-table'}, ...config},
@@ -318,6 +375,7 @@ function makeStore(config, docClient) {
       docClient,
       maxWriteRetries: 0, // no retry backoff sleeps in tests
       autoSchedule: false, // tests drive runSyncCycle() manually -- no background timer to race against
+      ...optionsOverrides,
     },
   );
 }
@@ -540,6 +598,115 @@ async function main() {
         assert.equal(store._lastSyncedModifiedId, '2030-01-01T00:00:00Z');
       } finally {
         osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'incremental sync alerts (loud log + webhook) when the newly-applied delta matches a package already cached locally',
+    async () => {
+      const osv = await startMockOsvServer();
+      const client = makeFakeDynamoClient();
+      const receiver = await startWebhookReceiver();
+      try {
+        await osv.setFixtureRecords([]);
+        osv.setCsvRows([]);
+        const logger = makeCapturingLogger();
+        const store = makeStore({baseUrl: osv.baseUrl}, client, {
+          logger,
+          webhookConfig: {
+            url: `${receiver.url}/alert`,
+            body: '{"pkg":"{{pkg}}","ver":"{{ver}}","malIds":"{{malIds}}"}',
+          },
+        });
+        await bootstrapStore(store);
+
+        const registryStorage = makeFakeRegistryStorage();
+        registryStorage.setExisting('newly-flagged', {
+          '1.0.0': {version: '1.0.0'},
+          '2.0.0': {version: '2.0.0'}, // outside the advisory's range -- must not alert
+        });
+        store.attachRegistryStorage(registryStorage);
+
+        osv.setCsvEtag('etag-v2');
+        osv.setCsvRows([{modified: '2030-01-01T00:00:00Z', id: 'MAL-2030-1'}]);
+        osv.setRecord(
+          'MAL-2030-1',
+          makeOsvRecord({
+            id: 'MAL-2030-1',
+            modified: '2030-01-01T00:00:00Z',
+            packageName: 'newly-flagged',
+            fixed: '1.5.0', // covers 1.0.0, not 2.0.0
+          }),
+        );
+        await store.runSyncCycle();
+
+        assert.equal(
+          logger.calls.error.length,
+          1,
+          'exactly one cached version (1.0.0) should have triggered the alert',
+        );
+        const [fields, message] = logger.calls.error[0];
+        assert.equal(fields.pkg, 'newly-flagged');
+        assert.equal(fields.ver, '1.0.0');
+        assert.match(message, /CACHED PACKAGE NOW FLAGGED/);
+
+        await waitFor(() => receiver.requests.length > 0);
+        assert.equal(receiver.requests.length, 1);
+        const payload = JSON.parse(receiver.requests[0].body);
+        assert.equal(payload.pkg, 'newly-flagged');
+        assert.equal(payload.ver, '1.0.0');
+        assert.equal(payload.malIds, 'MAL-2030-1');
+      } finally {
+        osv.server.close();
+        await receiver.close();
+      }
+    },
+  );
+
+  await check(
+    'bootstrap does not fire the retroactive alert, even for a package it flags that is already cached locally',
+    async () => {
+      const osv = await startMockOsvServer();
+      const client = makeFakeDynamoClient();
+      const receiver = await startWebhookReceiver();
+      try {
+        await osv.setFixtureRecords([
+          makeOsvRecord({
+            id: 'MAL-2025-99',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'already-cached',
+          }),
+        ]);
+        osv.setCsvRows([]);
+        const logger = makeCapturingLogger();
+        const registryStorage = makeFakeRegistryStorage();
+        registryStorage.setExisting('already-cached', {
+          '1.0.0': {version: '1.0.0'},
+        });
+
+        const store = makeStore({baseUrl: osv.baseUrl}, client, {
+          logger,
+          webhookConfig: {url: `${receiver.url}/alert`},
+        });
+        store.attachRegistryStorage(registryStorage); // attached before bootstrap runs
+
+        await bootstrapStore(store);
+
+        assert.ok(
+          store.check('already-cached', '1.0.0'),
+          'bootstrap should still apply the block itself',
+        );
+        assert.equal(
+          logger.calls.error.length,
+          0,
+          'bootstrap must not fire the retroactive alert -- it is a one-time historical load, not "new" OSV data',
+        );
+        await new Promise(resolve => setTimeout(resolve, 50)); // give any accidental async webhook a chance to arrive
+        assert.equal(receiver.requests.length, 0);
+      } finally {
+        osv.server.close();
+        await receiver.close();
       }
     },
   );

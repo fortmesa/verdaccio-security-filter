@@ -6,9 +6,11 @@ them, and (optionally) rejects a matching publish outright.
 
 **Type**: Verdaccio `filter_metadata` plugin, and optionally also a
 `middlewares` (Express) plugin -- see
-[Publish-time gate](docs/configuration.md#publish-time-gate). **Config key**:
-`filters.security-filter` (always), plus `middlewares.security-filter` (only if
-a publish-time gate is enabled).
+[Publish-time gate](docs/configuration.md#publish-time-gate). **Config key**
+(the literal, scoped package name -- Verdaccio never prefix-mangles a scoped
+plugin's config key): `filters."@fortmesa/verdaccio-security-filter"` (always),
+plus `middlewares."@fortmesa/verdaccio-security-filter"` (only if a publish-time
+gate, or the OSV retroactive-alert check, is enabled).
 
 ## What it does
 
@@ -48,6 +50,15 @@ for why this order):
    that have _always_ shipped install scripts (e.g. native addons) alone
    regardless of age.
 
+A publish-time gate (see
+[Publish-time gate](docs/configuration.md#publish-time-gate)) can additionally
+**reject** a matching publish outright rather than just hiding it, and every OSV
+sync proactively cross-references its newly-fetched data against packages
+already cached locally (see
+[Malicious-package blocklist (OSV)](docs/configuration.md#malicious-package-blocklist-osv)).
+Both fire a single, static, configurable
+[webhook](docs/configuration.md#webhooks) for immediate alerting.
+
 ## Installation
 
 ```bash
@@ -63,7 +74,7 @@ installing into a custom global location rather than a project's `node_modules`.
 
 ```yaml
 filters:
-  security-filter:
+  '@fortmesa/verdaccio-security-filter':
     packageAge:
       minDays: 2
       scriptCheckDays: 30
@@ -73,13 +84,16 @@ filters:
       - '@known-bad-scope/*'
     osv:
       enabled: false # see docs/configuration.md before enabling
+    webhook:
+      url: https://example.com/hooks/verdaccio-security # optional
+      body: '{"pkg":"{{pkg}}","ver":"{{ver}}","reason":"{{reason}}"}'
 ```
 
 See [`docs/configuration.md`](docs/configuration.md) for the full reference:
 manual block/allow list syntax, the OSV malicious-package blocklist (data
 source, sync mechanism, cost characteristics), MAL confidence filtering, CVE
 (GHSA) blocking, pluggable storage backends (filesystem/Redis/DynamoDB), the
-publish-time gate, and logging conventions.
+publish-time gate, webhooks, and logging conventions.
 
 ## Testing
 

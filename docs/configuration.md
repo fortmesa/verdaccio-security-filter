@@ -7,7 +7,7 @@ quick-start config. This page covers everything else in depth.
 
 ```yaml
 filters:
-  security-filter:
+  '@fortmesa/verdaccio-security-filter':
     packageAge:
       minDays: 2 # default 2 -- block versions newer than this
       scriptCheckDays: 30 # default 30 -- "recently introduced" window for install scripts
@@ -16,6 +16,12 @@ filters:
     allow: [] # optional manual allow list -- see below
     blockPublishWithNewScripts: false # see "Publish-time gate"
     blockPublishMatches: false # see "Publish-time gate"
+    # Single, static webhook target fired for every loud security event --
+    # see "Webhooks" below. Omit entirely to disable.
+    webhook:
+      url: https://example.com/hooks/verdaccio-security
+      body: '{"pkg":"{{pkg}}","ver":"{{ver}}","event":"{{event}}","reason":"{{reason}}"}'
+      content-type: application/json
     # Malicious-package blocklist sync -- see "Malicious-package blocklist (OSV)"
     osv:
       enabled: false
@@ -78,7 +84,7 @@ already uses:
 
 ```yaml
 filters:
-  security-filter:
+  '@fortmesa/verdaccio-security-filter':
     packageAge:
       thresholdDate: '2026-01-01' # only serve versions published before this date
     block:
@@ -202,6 +208,25 @@ anything about: a client that already finished `npm install` before the block
 took effect already has the bytes, on that machine or baked into a build
 artifact.
 
+That passive filtering happens silently, though -- it only becomes visible the
+next time some client happens to request that exact package again. On top of it,
+every **incremental** sync cycle (not bootstrap -- see below) also proactively
+cross-references each newly-applied delta against whatever this registry
+actually has cached/stored locally, right as the delta is ingested. A match logs
+the loud, `error`-level `!!! CACHED PACKAGE NOW FLAGGED !!!` line (see "Logging"
+below) and fires the configured `webhook:` (see "Webhooks" below) immediately,
+rather than waiting on a coincidental future read to surface it. This requires
+the plugin to also be listed under `middlewares:` (with at least an empty block,
+`{}`, if you don't otherwise need the publish-time gates) --
+`register_middlewares()` is the only Verdaccio hook that ever receives a
+`storage` reference, which this check needs to look up what's actually cached.
+Deliberately **not** run during bootstrap: that's a one-time, whole-history load
+of the entire OSV feed, and treating every one of its (potentially thousands of)
+entries as "new" would flood a fresh pod's first boot with alerts for advisories
+that predate this registry ever caching anything -- noise, not signal. An
+incremental sync's delta is genuinely new data, which is what this feature means
+to alert on.
+
 **`osv.blockStrategy`** (`remove` default, or `replace`) is one global policy
 for every OSV hit, not a per-entry setting like manual `block:` rules get -- the
 feed is auto-generated, not admin-authored, so there's no sensible place to
@@ -226,7 +251,7 @@ rest have two or more. Sources seen in practice include `amazon-inspector`,
 
 ```yaml
 filters:
-  security-filter:
+  '@fortmesa/verdaccio-security-filter':
     osv:
       malware:
         minOrigin: 1 # only block if the advisory has at least this many origins
@@ -264,7 +289,7 @@ the same sync machinery as the `MAL-` feed (bootstrap + incremental via
 
 ```yaml
 filters:
-  security-filter:
+  '@fortmesa/verdaccio-security-filter':
     osv:
       cve:
         severity: [] # e.g. [HIGH, CRITICAL] -- blocks any CVE at these severities, any CWE
@@ -330,7 +355,7 @@ of the MAL/CVE filtering logic above -- it's purely a storage-layer swap.
 
 ```yaml
 filters:
-  security-filter:
+  '@fortmesa/verdaccio-security-filter':
     osv:
       # dynamo -- picked when this section is present (checked before filesystem)
       dynamo:
@@ -411,7 +436,7 @@ Two independently-toggled flags close that gap, each **rejecting the
 
 ```yaml
 middlewares:
-  security-filter:
+  '@fortmesa/verdaccio-security-filter':
     blockPublishWithNewScripts: false # install-script introduction
     blockPublishMatches: false # OSV blocklist / manual block: matches
 ```
@@ -442,10 +467,15 @@ package during remediation).
 
 This requires the plugin to be listed under **both** `filters:` (for the
 read-time behavior above) **and** `middlewares:` (for these gates) -- they're
-loaded by Verdaccio as two independent plugin instances. The `block`/`allow`
-rule lists themselves are read from the canonical `filters: security-filter:`
-section of the full app config regardless of which instance is evaluating them,
-so they don't need to be duplicated under `middlewares:` too.
+loaded by Verdaccio as two independent plugin instances. The `block`/`allow`/
+`webhook` settings themselves are read from the canonical
+`filters: "@fortmesa/verdaccio-security-filter":` section of the full app config
+regardless of which instance is evaluating them, so they don't need to be
+duplicated under `middlewares:` too -- and must use that exact, literal scoped
+key: Verdaccio resolves a scoped plugin's config key verbatim, with no
+`verdaccio-` prefix mangling, so a bare `security-filter:` key here would never
+match and this shared lookup would silently fall back to each instance's own
+(much smaller) local config instead.
 
 **How it determines "new"**: on a `PUT` to the publish route, it parses the
 request body itself (this middleware runs before Verdaccio's own API router
@@ -457,6 +487,59 @@ in that body against the package's already-stored versions (via
 stored. This is robust to either shape npm sends (just the new version, or the
 full merged set) and naturally leaves `npm deprecate`/`npm star` requests
 untouched, since neither introduces a version key that isn't already stored.
+
+## Webhooks
+
+A single, static, operator-configured webhook target -- fired for every "loud"
+(`error`-level, see "Logging" below) security event this plugin raises: the four
+publish-time gate rejections above, plus the OSV-sync retroactive alert
+described in "Malicious-package blocklist (OSV)". This is deliberately minimal
+compared to a full pub/sub notification system: one config-defined URL, no
+dynamic per-admin-created subscriptions, no SSRF surface to defend against --
+`config.yaml` is the trust boundary here, same as `block:`/`allow:` above.
+
+```yaml
+filters:
+  '@fortmesa/verdaccio-security-filter':
+    webhook:
+      url: https://example.com/hooks/verdaccio-security
+      body: '{"pkg":"{{pkg}}","ver":"{{ver}}","event":"{{event}}","reason":"{{reason}}"}'
+      content-type: application/json
+      authorization: 'Bearer a-long-random-secret'
+```
+
+Like `block`/`allow`, this lives in the canonical
+`filters: "@fortmesa/verdaccio-security-filter":` section and is shared by both
+plugin instances.
+
+**Shape**: `url` and `body` are the only two recognized keys. `body`'s presence
+decides the HTTP method -- set it and the request is a `POST` with that body;
+omit it and the request is a `GET` with no body (useful for a receiver that only
+needs a ping, e.g. incrementing a counter). Every other key in the `webhook:`
+block is sent as an HTTP header, verbatim: the YAML key becomes the header name,
+the (substituted) value becomes the header value. There is no fixed header list
+-- set `content-type`, `authorization`, `x-anything`, whatever the receiver
+expects.
+
+**Templating**: `url`, `body`, and every header value are template strings.
+`{{name}}` is replaced with that field from the triggering event, or the empty
+string if the event didn't carry that field. Every event carries at least
+`event`, `pkg`, `ver`, and `reason` (the same human-readable sentence the
+publish-time gate's own 403 response body uses, or an equivalent one for the OSV
+retroactive alert); the four publish-time events also carry `user`; each event
+additionally carries whichever of `cveId`/`severity`/`cweIds`/`malIds`/
+`rule`/`scripts` apply to that specific reason (a manual `block:` match never
+carries `cveId`, for instance). See `webhook.js`'s call sites in `index.js`/
+`malicious-packages.js` for the exact field set per event.
+
+**Delivery**: fire-and-forget. A failed delivery (network error, timeout,
+non-2xx/3xx response) logs a `warn` and is otherwise ignored -- it never
+retries, never queues, and never blocks or fails the publish/sync that triggered
+it. A misconfigured `webhook.url` (missing entirely, or not a valid
+`http`/`https` URL once template substitution runs) fails loud at plugin
+construction (missing `url`) or logs an `error` and skips that one delivery
+(invalid after substitution) -- either way, it never breaks the security
+decision itself.
 
 ## Logging
 
@@ -478,6 +561,14 @@ decision, so it's treated as a noteworthy failure rather than a normal
 blocked/rejected/redirected one. Any OSV fetch or storage-backend failure during
 sync also logs at `error`, for the ordinary reason: it's an unexpected failure,
 not an active-attempt exception.
+
+The OSV-sync retroactive alert (see "Malicious-package blocklist (OSV)") is
+equally loud, at `error` with a
+`security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! ...` line -- distinct
+wording from `BLOCKED PUBLISH` since nothing was actually published or actively
+rejected at that moment; this is a passive discovery, not a live attempt, but no
+less worth immediate attention. Both loud event families also fire the
+configured `webhook:` (see "Webhooks" above), if any.
 
 ## Dependencies
 
