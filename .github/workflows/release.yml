@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Test
+        run: yarn test
+
+  publish-npm:
+    name: Publish npm package
+    needs: test
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # npmjs.dev.fort.blue runs verdaccio-oidc-auth and verifies a GitHub
+      # Actions OIDC token directly as a bearer credential -- no OAuth
+      # exchange, no browser. Its `github-actions` trusted-issuer config
+      # (fm-npmjs's k8s/02-configmap.yaml) must have this repo in its `allow`
+      # list, and the audience below must match its configured `audience`
+      # exactly, or this 401s.
+      - name: Get OIDC token for npmjs.dev.fort.blue
+        id: oidc
+        run: |
+          set -eu
+          TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://npmjs.dev.fort.blue" \
+            | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).value))')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      # Scoped to this job's ephemeral checkout only -- never written to the
+      # repo's own committed .yarnrc.yml/package.json.
+      - name: Configure npm registry for @fortmesa scope
+        env:
+          NPM_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -eu
+          yarn config set 'npmScopes.fortmesa.npmRegistryServer' 'https://npmjs.dev.fort.blue'
+          yarn config set 'npmScopes.fortmesa.npmAlwaysAuth' true
+          yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
+
+      - name: Publish to npmjs.dev.fort.blue
+        run: yarn npm publish --access public
+
+  release:
+    name: Create release
+    needs: test
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Assemble release assets
+        run: |
+          set -eu
+          mkdir -p dist
+          # Same tarball publish-npm uploads to npmjs.dev.fort.blue, attached
+          # here too so it can be inspected/downloaded without registry
+          # access, and outlives that registry's own retention policy.
+          yarn pack -o "dist/verdaccio-security-filter-${{ github.ref_name }}.tgz"
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

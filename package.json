@@ -1,0 +1,68 @@
+{
+  "name": "@fortmesa/verdaccio-security-filter",
+  "version": "1.0.0",
+  "description": "Verdaccio filter plugin: blocks versions that are too new, published after a date threshold, match a synced OSV malicious-package blocklist, match a manual block/allow list, or newly introduce install scripts, and (optionally, as a middlewares plugin) rejects publishing such versions outright",
+  "license": "MIT",
+  "repository": "fortmesa/verdaccio-security-filter",
+  "homepage": "https://github.com/fortmesa/verdaccio-security-filter#readme",
+  "keywords": [
+    "verdaccio",
+    "verdaccio-plugin",
+    "npm-registry",
+    "supply-chain-security",
+    "malware-detection",
+    "osv"
+  ],
+  "main": "index.js",
+  "packageManager": "yarn@4.17.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "index.js",
+    "malicious-packages.js",
+    "dynamodb-store.js",
+    "filesystem-store.js",
+    "redis-store.js",
+    "osv-client.js"
+  ],
+  "scripts": {
+    "prepare": "husky",
+    "test": "node test/smoke.js && node test/smoke-malicious-packages.js && node test/smoke-storage-backends.js"
+  },
+  "lint-staged": {
+    "**/*.{js,yml,yaml,json,md}": [
+      "prettier --write"
+    ]
+  },
+  "dependencies": {
+    "body-parser": "^1.20.3",
+    "semver": "^7.6.0",
+    "yauzl": "^3.1.0"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1075.0",
+    "@aws-sdk/lib-dynamodb": "^3.1075.0",
+    "ioredis": "^5.4.1"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-dynamodb": {
+      "optional": true
+    },
+    "@aws-sdk/lib-dynamodb": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1075.0",
+    "@aws-sdk/lib-dynamodb": "^3.1075.0",
+    "husky": "^9.1.7",
+    "ioredis": "^5.4.1",
+    "lint-staged": "^17.0.8",
+    "prettier": "^3.3.3",
+    "yazl": "^3.3.1"
+  }
+}

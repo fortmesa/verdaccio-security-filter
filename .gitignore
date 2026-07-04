@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Yarn Berry -- nodeLinker is node-modules (see .yarnrc.yml) and versions are
+# Corepack-managed, so .yarn/ is just a regenerable local cache/state dir.
+.yarn/
+.pnp.*
