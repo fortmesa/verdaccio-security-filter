@@ -108,7 +108,7 @@ each storage backend's CRUD contract.
 
 ## Dependencies
 
-`semver`, `body-parser`, `yauzl` -- see
+`semver`, `body-parser`, `minimatch`, `yauzl` -- see
 [Dependencies](docs/configuration.md#dependencies) for what each is used for.
 `@aws-sdk/client-dynamodb`, `@aws-sdk/lib-dynamodb`, and `ioredis` are optional
 peer dependencies -- only install the one matching whichever OSV storage backend

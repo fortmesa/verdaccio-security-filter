@@ -29,6 +29,7 @@ const {
   _resetSharedStoreForTests,
 } = require('../malicious-packages.js');
 const {createDynamoDbStore} = require('../dynamodb-store.js');
+const osvClient = require('../osv-client.js');
 
 const NOOP_LOGGER = {warn() {}, error() {}, info() {}, fatal() {}};
 
@@ -138,13 +139,20 @@ function makeGhsaRecord({
   packageName,
   introduced = '0',
   fixed = null,
+  lastAffected = null,
+  lastKnownAffectedVersionRange = null,
   withdrawn = false,
   severity = 'HIGH',
   cweIds = ['CWE-79'],
   cveId,
+  cvss3Vector = null,
+  cvss4Vector = null,
 }) {
   const events = [{introduced}];
+  // The OSV schema forbids both appearing on the same range -- callers pass
+  // at most one of fixed/lastAffected, same as a real record ever would.
   if (fixed) events.push({fixed});
+  if (lastAffected) events.push({last_affected: lastAffected});
   return {
     schema_version: '1.7.3',
     id,
@@ -161,8 +169,30 @@ function makeGhsaRecord({
           purl: `pkg:npm/${packageName}`,
         },
         ranges: [{type: 'SEMVER', events}],
+        // Real GHSA records (e.g. xlsx's GHSA-5pgg-2g8v-p4x9) carry this
+        // per-affected-entry, non-standard field when there's no structured
+        // fixed/last_affected event at all -- see osv-client.js's
+        // parseLastKnownAffectedVersionRange().
+        ...(lastKnownAffectedVersionRange
+          ? {
+              database_specific: {
+                last_known_affected_version_range:
+                  lastKnownAffectedVersionRange,
+              },
+            }
+          : {}),
       },
     ],
+    // Real records carry this at the record's top level, independent of
+    // database_specific -- see osv-client.js's computeCvssScores().
+    ...(cvss3Vector || cvss4Vector
+      ? {
+          severity: [
+            ...(cvss3Vector ? [{type: 'CVSS_V3', score: cvss3Vector}] : []),
+            ...(cvss4Vector ? [{type: 'CVSS_V4', score: cvss4Vector}] : []),
+          ],
+        }
+      : {}),
     database_specific: {severity, cwe_ids: cweIds},
   };
 }
@@ -475,7 +505,9 @@ async function main() {
           'ranges',
           'sources',
         ]);
-        assert.deepEqual(stored.ranges, [{introduced: '0', fixed: null}]);
+        assert.deepEqual(stored.ranges, [
+          {introduced: '0', fixed: null, lastAffected: null},
+        ]);
       } finally {
         osv.server.close();
       }
@@ -519,7 +551,7 @@ async function main() {
   );
 
   await check(
-    'second poll against an unchanged CSV short-circuits at 304 with zero DynamoDB calls',
+    'second poll against an unchanged CSV short-circuits at 304 with only the one version-check DynamoDB call',
     async () => {
       const osv = await startMockOsvServer();
       const client = makeFakeDynamoClient();
@@ -534,8 +566,8 @@ async function main() {
         await store.runSyncCycle(); // steady-state now; CSV etag hasn't changed
         assert.equal(
           client.callCount(),
-          callsAfterBootstrap,
-          'a 304 poll must make zero further DynamoDB calls',
+          callsAfterBootstrap + 1,
+          'a 304 poll must make exactly one DynamoDB call -- the once-per-cycle version check -- and nothing further',
         );
       } finally {
         osv.server.close();
@@ -905,7 +937,11 @@ async function main() {
         assert.ok(hit);
         assert.equal(hit.type, 'cve');
         assert.equal(hit.cveId, 'CVE-2025-1');
-        assert.equal(hit.severity, 'HIGH');
+        assert.equal(
+          hit.severity,
+          'high',
+          'severity is normalized to lowercase at extraction, regardless of the uppercase fixture/config casing used above',
+        );
 
         const nonMatching = makeStore(
           {baseUrl: osv.baseUrl, cve: {severity: ['LOW']}},
@@ -920,6 +956,273 @@ async function main() {
       } finally {
         osv.server.close();
       }
+    },
+  );
+
+  await check(
+    'osv.cve.severity/osv.cve.cwe accept lowercase config values too -- both cases are forced to the same lowercase form, so neither errors and both match the same (uppercase-in-OSV) data',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([
+          makeGhsaRecord({
+            id: 'GHSA-8888-8888-8888',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'lowercase-cfg-pkg',
+            severity: 'HIGH', // real OSV feed data is always uppercase
+            cweIds: ['CWE-79'],
+          }),
+        ]);
+        osv.setCsvRows([]);
+
+        const lowercaseCfg = makeStore(
+          {
+            baseUrl: osv.baseUrl,
+            cve: {
+              severity: ['high', 'critical'],
+              cwe: [{'CWE-79': ['high']}],
+            },
+          },
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(lowercaseCfg);
+        assert.ok(
+          lowercaseCfg.check('lowercase-cfg-pkg', '1.0.0'),
+          'lowercase config must match real uppercase-in-OSV data without a config error',
+        );
+
+        const uppercaseCfg = makeStore(
+          {baseUrl: osv.baseUrl, cve: {severity: ['HIGH']}},
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(uppercaseCfg);
+        assert.ok(
+          uppercaseCfg.check('lowercase-cfg-pkg', '1.0.0'),
+          'uppercase config (matching the documented examples) must keep working exactly as before',
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'CVE last_affected event blocks up to and including that version, unlike fixed which is exclusive',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([
+          makeGhsaRecord({
+            id: 'GHSA-3333-3333-3333',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'last-affected-pkg',
+            severity: 'HIGH',
+            cweIds: ['CWE-79'],
+            cveId: 'CVE-2025-2',
+            lastAffected: '1.2.3',
+          }),
+        ]);
+        osv.setCsvRows([]);
+
+        const store = makeStore(
+          {baseUrl: osv.baseUrl, cve: {severity: ['HIGH', 'CRITICAL']}},
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(store);
+
+        assert.ok(
+          store.check('last-affected-pkg', '1.2.3'),
+          'last_affected is inclusive -- the last_affected version itself is still vulnerable',
+        );
+        assert.ok(store.check('last-affected-pkg', '1.0.0'));
+        assert.equal(
+          store.check('last-affected-pkg', '1.2.4'),
+          null,
+          'the version immediately above last_affected should be unaffected',
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'CVE with no structured fixed/last_affected falls back to the free-text last_known_affected_version_range override (xlsx-shaped)',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([
+          makeGhsaRecord({
+            id: 'GHSA-5pgg-2g8v-p4x9',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'xlsx-shaped-pkg',
+            severity: 'HIGH',
+            cweIds: ['CWE-1333'],
+            lastKnownAffectedVersionRange: '< 0.20.2',
+          }),
+        ]);
+        osv.setCsvRows([]);
+
+        const store = makeStore(
+          {baseUrl: osv.baseUrl, cve: {severity: ['HIGH', 'CRITICAL']}},
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(store);
+
+        assert.ok(
+          store.check('xlsx-shaped-pkg', '0.20.1'),
+          'the free-text override should recover a real fixed boundary',
+        );
+        assert.equal(
+          store.check('xlsx-shaped-pkg', '0.20.2'),
+          null,
+          '"<" is exclusive, same as a structured fixed event',
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'CVE with no structured fixed/last_affected and an unparseable override stays open (fails closed, unchanged from before the fallback existed)',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([
+          makeGhsaRecord({
+            id: 'GHSA-6666-6666-6666',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'garbage-override-pkg',
+            severity: 'HIGH',
+            cweIds: ['CWE-1333'],
+            lastKnownAffectedVersionRange: '>=1.0.0 <2.0.0 || >=3.0.0',
+          }),
+        ]);
+        osv.setCsvRows([]);
+
+        const store = makeStore(
+          {baseUrl: osv.baseUrl, cve: {severity: ['HIGH', 'CRITICAL']}},
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(store);
+
+        assert.ok(
+          store.check('garbage-override-pkg', '99.0.0'),
+          'a multi-clause/unparseable override must not silently narrow the range -- it stays open',
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'CVE cvss3Min blocks at or above the configured threshold, independent of severity/cwe',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        // Real vector from lodash's GHSA-35jh-r3h4-6jhm -- verified against
+        // the live npm registry's own reported score of 7.2.
+        await osv.setFixtureRecords([
+          makeGhsaRecord({
+            id: 'GHSA-4444-4444-4444',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'cvss3-pkg',
+            cvss3Vector: 'CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H',
+          }),
+        ]);
+        osv.setCsvRows([]);
+
+        const blocking = makeStore(
+          {baseUrl: osv.baseUrl, cve: {cvss3Min: 7.0}},
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(blocking);
+        assert.ok(
+          blocking.check('cvss3-pkg', '1.0.0'),
+          'a score of 7.2 should match a minimum of 7.0',
+        );
+
+        const nonBlocking = makeStore(
+          {baseUrl: osv.baseUrl, cve: {cvss3Min: 7.3}},
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(nonBlocking);
+        assert.equal(
+          nonBlocking.check('cvss3-pkg', '1.0.0'),
+          null,
+          'a score of 7.2 should not match a minimum of 7.3',
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'CVE cvss4Min blocks independently of cvss3Min -- configuring one never triggers via the other',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        // Real vector shape verified against ae-cvss-calculator directly
+        // (base score 8.8).
+        await osv.setFixtureRecords([
+          makeGhsaRecord({
+            id: 'GHSA-5555-5555-5555',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'cvss4-pkg',
+            cvss4Vector:
+              'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:N/SC:N/SI:N/SA:N',
+          }),
+        ]);
+        osv.setCsvRows([]);
+
+        const cvss4Only = makeStore(
+          {baseUrl: osv.baseUrl, cve: {cvss4Min: 8.0}},
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(cvss4Only);
+        assert.ok(
+          cvss4Only.check('cvss4-pkg', '1.0.0'),
+          'a v4 score of 8.8 should match a cvss4Min of 8.0',
+        );
+
+        const cvss3Only = makeStore(
+          {baseUrl: osv.baseUrl, cve: {cvss3Min: 1.0}},
+          makeFakeDynamoClient(),
+        );
+        await bootstrapStore(cvss3Only);
+        assert.equal(
+          cvss3Only.check('cvss4-pkg', '1.0.0'),
+          null,
+          'a record with no v3 score must never match via cvss3Min, even a permissive one',
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'osv.cve.cvss3Min/cvss4Min out of the 0-10 range fails loud at construction',
+    async () => {
+      assert.throws(
+        () =>
+          makeStore(
+            {baseUrl: 'http://unused', cve: {cvss3Min: 11}},
+            makeFakeDynamoClient(),
+          ),
+        /osv\.cve\.cvss3Min must be a number between 0 and 10/,
+      );
+      assert.throws(
+        () =>
+          makeStore(
+            {baseUrl: 'http://unused', cve: {cvss4Min: -1}},
+            makeFakeDynamoClient(),
+          ),
+        /osv\.cve\.cvss4Min must be a number between 0 and 10/,
+      );
     },
   );
 
@@ -1219,6 +1522,144 @@ async function main() {
           client.table.get('mal-only-pkg'),
           undefined,
           'the whole item should be deleted once both dimensions are empty',
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'a stored extractionSchemaVersion mismatch (or none at all) forces a full re-bootstrap instead of loading stale data',
+    async () => {
+      const client = makeFakeDynamoClient();
+      // Simulate a table an older code version already populated: sync
+      // state with no extractionSchemaVersion field at all, and an item
+      // shaped the way pre-fix code would have written it (uppercase
+      // severity, no cvss3Score/cvss4Score) -- exactly the staleness this
+      // mechanism exists to catch.
+      client.table.set('__sync_state__', {
+        pk: '__sync_state__',
+        bootstrapCompletedAt: '2020-01-01T00:00:00Z',
+        lastSyncedModifiedId: '2020-01-01T00:00:00Z',
+        csvEtag: 'stale-etag',
+        csvLastModified: 'stale-last-modified',
+      });
+      client.table.set('stale-pkg', {
+        pk: 'stale-pkg',
+        cves: [
+          {
+            id: 'GHSA-old',
+            severity: 'HIGH', // pre-fix code stored this uppercase
+            cweIds: [],
+            ranges: [{introduced: '0', fixed: null}],
+          },
+        ],
+      });
+
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([
+          makeGhsaRecord({
+            id: 'GHSA-fresh-1',
+            modified: '2025-06-01T00:00:00Z',
+            packageName: 'fresh-pkg',
+            severity: 'CRITICAL',
+            cweIds: ['CWE-1321'],
+          }),
+        ]);
+        osv.setCsvRows([]);
+
+        const store = makeStore(
+          {baseUrl: osv.baseUrl, cve: {severity: ['CRITICAL']}},
+          client,
+        );
+        await store.ready; // warm-start alone -- should discard the stale table entirely
+
+        assert.equal(
+          store.check('stale-pkg', '1.0.0'),
+          null,
+          'data written under an old/missing extractionSchemaVersion must not be loaded into memory',
+        );
+
+        await store.runSyncCycle(); // must run a full bootstrap, not an incremental sync
+        assert.ok(
+          store.check('fresh-pkg', '1.0.0'),
+          'the forced re-bootstrap should have picked up the fresh OSV fixture data',
+        );
+
+        const stateItem = client.table.get('__sync_state__');
+        assert.equal(
+          stateItem.extractionSchemaVersion,
+          osvClient.EXTRACTION_SCHEMA_VERSION,
+          'the fresh bootstrap should stamp the current schema version going forward',
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'a stored extractionSchemaVersion NEWER than this code refuses to start, rather than serving degraded',
+    async () => {
+      const client = makeFakeDynamoClient();
+      client.table.set('__sync_state__', {
+        pk: '__sync_state__',
+        bootstrapCompletedAt: '2026-01-01T00:00:00Z',
+        lastSyncedModifiedId: '2026-01-01T00:00:00Z',
+        csvEtag: 'future-etag',
+        csvLastModified: 'future-last-modified',
+        extractionSchemaVersion: osvClient.EXTRACTION_SCHEMA_VERSION + 1,
+      });
+
+      const exitCalls = [];
+      const store = makeStore({baseUrl: 'http://unused'}, client, {
+        exitProcess: code => exitCalls.push(code),
+      });
+      await store.ready;
+
+      assert.deepEqual(
+        exitCalls,
+        [1],
+        'a newer-than-this-code stored version must call exitProcess(1) exactly once',
+      );
+      assert.equal(
+        store._bootstrapCompletedAt,
+        null,
+        'must not have applied the newer stored state as if it were current',
+      );
+    },
+  );
+
+  await check(
+    'runSyncCycle() sits out a cycle (does not bootstrap or incrementally sync) if the shared state has moved to a newer schema mid-operation',
+    async () => {
+      const client = makeFakeDynamoClient();
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([]);
+        osv.setCsvRows([]);
+        const store = makeStore({baseUrl: osv.baseUrl}, client);
+        await bootstrapStore(store); // establishes this pod at the current schema version
+
+        // Simulate some other, already-upgraded instance moving the shared
+        // state forward in the meantime.
+        client.table.set('__sync_state__', {
+          ...client.table.get('__sync_state__'),
+          extractionSchemaVersion: osvClient.EXTRACTION_SCHEMA_VERSION + 1,
+        });
+
+        const callCountBefore = client.callCount();
+        await store.runSyncCycle();
+        // Only the one extra getItem(SYNC_STATE_KEY) read -- no bootstrap
+        // (a Scan) and no incremental sync (a modified_id.csv fetch, which
+        // would show up as an HTTP call, not a DynamoDB one, but the point
+        // is neither branch below the version check should have run at all).
+        assert.equal(
+          client.callCount(),
+          callCountBefore + 1,
+          'should only perform the one version-check read, then return -- no bootstrap or incremental sync work',
         );
       } finally {
         osv.server.close();

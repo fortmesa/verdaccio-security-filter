@@ -2,6 +2,7 @@
 
 const semver = require('semver');
 const bodyParser = require('body-parser');
+const {minimatch} = require('minimatch');
 const {getAdvisoryStore} = require('./malicious-packages');
 const {sendWebhook} = require('./webhook');
 
@@ -30,17 +31,14 @@ function hasCleanBaseline(existingVersions) {
 // Manual block:/allow: rule matching. Each entry is either a bare glob
 // pattern string (matches every version) or a single-key {pattern: {versions?,
 // strategy?}} object for version-scoped/replace rules -- same bare-string-or-
-// single-key-object shape osv.cve.cwe below already uses. Patterns follow
-// Verdaccio's own packages: matching convention (also used in
-// k8s/02-configmap.yaml): an exact name, a `prefix*` glob, or `**` for
-// everything.
-function matchesPattern(pattern, name) {
-  if (pattern === '**') return true;
-  if (pattern.endsWith('*')) return name.startsWith(pattern.slice(0, -1));
-  return pattern === name;
-}
+// single-key-object shape osv.cve.cwe below already uses. Patterns use real
+// minimatch -- the same convention Verdaccio's own packages: access-control
+// config uses (@verdaccio/utils's getMatchedPackagesSpec), not a narrower
+// hand-rolled matcher -- so an operator configuring this plugin already
+// knows this syntax from Verdaccio core itself, and every plugin in this
+// family (see verdaccio-attestations) matches package names the same way.
 function matchesPackage(rule, name) {
-  return matchesPattern(rule.pattern, name);
+  return minimatch(name, rule.pattern);
 }
 function matchesVersion(rule, version) {
   return (

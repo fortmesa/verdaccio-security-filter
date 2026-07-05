@@ -11,9 +11,20 @@
 // for why that matters at ~220k current entries.
 
 const yauzl = require('yauzl');
+const {Cvss3P1, Cvss4P0} = require('ae-cvss-calculator');
 
 const MAL_ID_PREFIX = 'MAL-';
 const CVE_ID_PREFIX = 'GHSA-';
+
+// Bump this whenever a change to the extraction logic in this file means
+// data an older version already wrote to storage is stale/incomplete in a
+// way the sync loop's own modified_id.csv watermark can never detect on its
+// own (that watermark only tracks whether OSV's *data* changed, not whether
+// this plugin's own interpretation of it did). malicious-packages.js
+// compares this against what's stored in SYNC_STATE_KEY at warm-start and
+// forces a full re-bootstrap on any mismatch, rather than waiting for each
+// individual advisory to happen to receive a fresh OSV-side update.
+const EXTRACTION_SCHEMA_VERSION = 2;
 
 function isMalRecord(id) {
   return typeof id === 'string' && id.startsWith(MAL_ID_PREFIX);
@@ -23,21 +34,62 @@ function isCveRecord(id) {
   return typeof id === 'string' && id.startsWith(CVE_ID_PREFIX);
 }
 
-// Normalizes one affected[] entry's ranges[].events into {introduced, fixed}
-// pairs. "0" is OSV's own sentinel for "no lower bound" -- preserved as-is
-// and interpreted later by malicious-packages.js's version matcher, so both
-// the bootstrap and incremental paths share one meaning for it.
+// Normalizes one affected[] entry's ranges[].events into {introduced, fixed,
+// lastAffected} triples. "0" is OSV's own sentinel for "no lower bound" --
+// preserved as-is and interpreted later by malicious-packages.js's version
+// matcher, so both the bootstrap and incremental paths share one meaning
+// for it.
+//
+// `fixed` and `lastAffected` are kept as two separate fields, not one,
+// because the OSV schema defines them with different upper-bound semantics
+// (https://ossf.github.io/osv-schema/): `fixed` is exclusive (versions >=
+// fixed are safe), `last_affected` is inclusive ("versions above
+// last_affected should be considered unaffected"). The schema also
+// guarantees a range's events never contain both -- "can contain either
+// last_affected or fixed events, but not both" -- so exactly one of these
+// two fields (or neither, for a still-open/unfixed range) is ever set per
+// range; there's no conflict to resolve between them.
+// GitHub's own free-text escape hatch for a fix boundary the OSV events[]
+// structure has no field for at all -- carried at the per-affected-entry
+// level as database_specific.last_known_affected_version_range (NOT part of
+// the core OSV schema; GitHub's own docs say database_specific "is not
+// intended to influence vulnerability evaluation," so this is only ever
+// consulted as a last resort, never in preference to a real structured
+// event). Best-effort, on purpose: only the two single-clause forms
+// actually observed in the wild ("< X", "<= X") are parsed; anything else
+// -- multiple clauses, other operators, garbage -- returns null and leaves
+// the range open/unbounded, exactly like today's fail-closed handling of
+// any other unparseable bound.
+function parseLastKnownAffectedVersionRange(raw) {
+  if (typeof raw !== 'string') return null;
+  const m = raw.trim().match(/^(<=|<)\s*(\S+)$/);
+  if (!m) return null;
+  const [, operator, version] = m;
+  return operator === '<=' ? {lastAffected: version} : {fixed: version};
+}
+
 function normalizeRanges(affectedEntry) {
   const ranges = [];
   for (const range of affectedEntry.ranges ?? []) {
     if (range.type !== 'SEMVER' && range.type !== 'ECOSYSTEM') continue;
     let introduced = '0';
     let fixed = null;
+    let lastAffected = null;
     for (const event of range.events ?? []) {
       if (event.introduced !== undefined) introduced = event.introduced;
       if (event.fixed !== undefined) fixed = event.fixed;
+      if (event.last_affected !== undefined) lastAffected = event.last_affected;
     }
-    ranges.push({introduced, fixed});
+    if (fixed == null && lastAffected == null) {
+      const fallback = parseLastKnownAffectedVersionRange(
+        affectedEntry.database_specific?.last_known_affected_version_range,
+      );
+      if (fallback) {
+        fixed = fallback.fixed ?? null;
+        lastAffected = fallback.lastAffected ?? null;
+      }
+    }
+    ranges.push({introduced, fixed, lastAffected});
   }
   return ranges;
 }
@@ -84,6 +136,33 @@ function extractMalRecord(raw) {
   };
 }
 
+// Computes the CVSS base score for each version actually present on the
+// record's top-level severity[] array (real npm GHSA data only ever
+// carries CVSS_V3 -- specifically 3.1, never 3.0 -- and/or CVSS_V4;
+// verified directly against a 220-record live sample, no V2 observed).
+// Kept as two independent fields, not collapsed into one -- osv.cve.cvss3/
+// osv.cve.cwe4 filter on each separately, mirroring how severity/cwe are
+// each their own dimension. A missing or unparseable vector for a given
+// version just leaves that field null; it never blocks the other version's
+// score or falls back to it.
+function computeCvssScores(raw) {
+  let cvss3Score = null;
+  let cvss4Score = null;
+  for (const entry of raw.severity ?? []) {
+    try {
+      if (entry.type === 'CVSS_V3' && cvss3Score == null) {
+        cvss3Score = new Cvss3P1(entry.score).calculateScores().base;
+      } else if (entry.type === 'CVSS_V4' && cvss4Score == null) {
+        cvss4Score = new Cvss4P0(entry.score).calculateScores().base;
+      }
+    } catch {
+      // Malformed/unsupported vector string -- leave that score null rather
+      // than let one bad entry abort extraction of the rest of the record.
+    }
+  }
+  return {cvss3Score, cvss4Score};
+}
+
 // GHSA (real CVE-backed) records use the same affected[]/ranges[] shape as
 // MAL, but ~840 npm records across the feed instead give an explicit
 // affected[].versions list -- both forms are kept (as parallel `ranges`/
@@ -115,12 +194,22 @@ function extractCveRecord(raw) {
       a => typeof a === 'string' && a.startsWith('CVE-'),
     ) ?? null;
 
+  const {cvss3Score, cvss4Score} = computeCvssScores(raw);
+
   return {
     id: raw.id,
     modified: raw.modified,
     cveId,
-    severity: raw.database_specific?.severity ?? null,
+    // Lowercased here, at the source -- OSV's own bucket is uppercase
+    // (LOW/MODERATE/HIGH/CRITICAL), but lowercase is this plugin's
+    // canonical internal form (matches npm/yarn's audit wire format; see
+    // malicious-packages.js's KNOWN_SEVERITIES). Every consumer of
+    // extracted CVE data gets the normalized form for free -- there's no
+    // second place that still expects uppercase.
+    severity: raw.database_specific?.severity?.toLowerCase() ?? null,
     cweIds: raw.database_specific?.cwe_ids ?? [],
+    cvss3Score,
+    cvss4Score,
     packages: Array.from(byPackage, ([name, {ranges, versions}]) => ({
       name,
       ranges,
@@ -313,4 +402,5 @@ module.exports = {
   fetchAllRecords,
   fetchModifiedCsv,
   fetchRecord,
+  EXTRACTION_SCHEMA_VERSION,
 };

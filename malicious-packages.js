@@ -26,7 +26,26 @@ const osvClient = require('./osv-client');
 const {sendWebhook} = require('./webhook');
 
 const SYNC_STATE_KEY = '__sync_state__'; // safe: npm forbids package names starting with '_'
-const KNOWN_SEVERITIES = new Set(['LOW', 'MODERATE', 'HIGH', 'CRITICAL']);
+
+// -1: stored is older than (or absent relative to) this code's own
+//     osvClient.EXTRACTION_SCHEMA_VERSION -- self-heal via a full re-bootstrap.
+//  0: stored matches this code's version -- safe to proceed normally.
+//  1: stored is NEWER than this code's version -- some other, already-
+//     upgraded instance has moved the shared state forward. At startup this
+//     means refusing to run (see _warmStart()); mid-operation it means
+//     sitting out this sync cycle (see runSyncCycle()) rather than writing
+//     under a schema this code's own extraction logic no longer matches.
+function compareSchemaVersion(storedVersion) {
+  if (storedVersion == null) return -1;
+  if (storedVersion === osvClient.EXTRACTION_SCHEMA_VERSION) return 0;
+  return storedVersion < osvClient.EXTRACTION_SCHEMA_VERSION ? -1 : 1;
+}
+// Lowercase is the canonical internal form -- matches npm/yarn's own audit
+// wire format (severity is lowercase there), not OSV's native uppercase
+// bucket. Both OSV data (extractCveRecord in osv-client.js) and config
+// values (parseCveSeverities below) are normalized to this before ever
+// being compared, so operators can keep writing either case in config.
+const KNOWN_SEVERITIES = new Set(['low', 'moderate', 'high', 'critical']);
 
 // Storage backend is auto-selected from whichever of osv.redis/osv.dynamo/
 // osv.filesystem is actually configured, in this priority order -- no
@@ -43,29 +62,44 @@ function pickStorageKind(config) {
   );
 }
 
-// A whole-package block is just a range of {introduced:"0", fixed:null} --
-// no separate code path is needed for "whole package" vs "specific
-// versions," this is the only matcher either case ever goes through.
-// Unparseable bounds fail closed toward *more* blocking (an unparseable
-// `fixed` doesn't exempt anything above it; an unparseable `introduced`
-// doesn't exempt anything below it), matching this plugin's existing
-// "unknown -> block" philosophy elsewhere (e.g. an unknown publish date).
+// A whole-package block is just a range of {introduced:"0", fixed:null,
+// lastAffected:null} -- no separate code path is needed for "whole package"
+// vs "specific versions," this is the only matcher either case ever goes
+// through. Unparseable bounds fail closed toward *more* blocking (an
+// unparseable `fixed`/`lastAffected` doesn't exempt anything above it, an
+// unparseable `introduced` doesn't exempt anything below it), matching this
+// plugin's existing "unknown -> block" philosophy elsewhere (e.g. an
+// unknown publish date). A range with neither `fixed` nor `lastAffected`
+// set (still open, no known fix) matches everything from `introduced`
+// onward, forever -- same fail-closed principle.
+//
+// `fixed` and `lastAffected` use different upper-bound semantics per the
+// OSV schema -- `fixed` is exclusive, `lastAffected` is inclusive -- and
+// osv-client.js's normalizeRanges() guarantees at most one of the two is
+// ever set on a given range (the schema forbids both appearing together),
+// so checking `fixed` first and falling back to `lastAffected` never
+// discards real data.
 function versionMatchesRanges(version, ranges) {
   const parsed = semver.valid(version) ?? semver.valid(semver.coerce(version));
   if (!parsed) return true; // can't parse the version of an already-flagged package -- fail closed
 
-  return ranges.some(({introduced, fixed}) => {
+  return ranges.some(({introduced, fixed, lastAffected}) => {
     const lower =
       introduced === '0'
         ? null
         : (semver.valid(introduced) ?? semver.valid(semver.coerce(introduced)));
-    const upper =
-      fixed == null
-        ? null
-        : (semver.valid(fixed) ?? semver.valid(semver.coerce(fixed)));
-    const lowerOk = lower == null || semver.gte(parsed, lower);
-    const upperOk = upper == null || semver.lt(parsed, upper);
-    return lowerOk && upperOk;
+    if (lower != null && semver.lt(parsed, lower)) return false;
+
+    if (fixed != null) {
+      const upper = semver.valid(fixed) ?? semver.valid(semver.coerce(fixed));
+      return upper == null || semver.lt(parsed, upper);
+    }
+    if (lastAffected != null) {
+      const upper =
+        semver.valid(lastAffected) ?? semver.valid(semver.coerce(lastAffected));
+      return upper == null || semver.lte(parsed, upper);
+    }
+    return true; // no upper bound at all -- matches everything from introduced onward
   });
 }
 
@@ -78,15 +112,33 @@ function parseNonNegativeInt(value, name) {
   return value;
 }
 
+// osv.cve.cvss3Min/osv.cve.cvss4Min -- a minimum-threshold config, same
+// shape as osv.malware.minOrigin, not a list like osv.cve.severity (a
+// continuous score has no discrete enum to list). null (the default) means
+// disabled -- matches osv.cve.severity/osv.cve.cwe's own "empty list ->
+// disabled" convention.
+function parseCvssMin(value, name) {
+  if (value == null) return null;
+  if (typeof value !== 'number' || value < 0 || value > 10) {
+    throw new Error(
+      `security-filter: ${name} must be a number between 0 and 10, got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
 function parseCveSeverities(list, source) {
-  for (const sev of list) {
+  const normalized = list.map(sev =>
+    typeof sev === 'string' ? sev.toLowerCase() : sev,
+  );
+  for (const sev of normalized) {
     if (!KNOWN_SEVERITIES.has(sev)) {
       throw new Error(
         `security-filter: ${source} has unknown severity '${sev}' -- must be one of ${Array.from(KNOWN_SEVERITIES).join(', ')}`,
       );
     }
   }
-  return list;
+  return normalized;
 }
 
 // Normalizes the osv.cve.cwe config list -- entries are either a bare CWE id
@@ -124,7 +176,10 @@ function parseCweRules(list, source) {
         `security-filter: ${source} entry must be a CWE id string or a {cweId: [severities]} object: ${JSON.stringify(entry)}`,
       );
     }
-    parseCveSeverities(severities, `${source} entry for '${cweId}'`);
+    severities = parseCveSeverities(
+      severities,
+      `${source} entry for '${cweId}'`,
+    );
     if (rules.has(cweId)) {
       throw new Error(
         `security-filter: ${source} lists '${cweId}' more than once`,
@@ -175,6 +230,8 @@ class MaliciousPackageStore {
       'osv.cve.severity',
     );
     this.cweRules = parseCweRules(cve.cwe ?? [], 'osv.cve.cwe');
+    this.cvss3Min = parseCvssMin(cve.cvss3Min, 'osv.cve.cvss3Min');
+    this.cvss4Min = parseCvssMin(cve.cvss4Min, 'osv.cve.cvss4Min');
 
     if (!this.enabled) return; // inert: check() always returns null, no storage client, no timers, no HTTP calls
 
@@ -202,6 +259,12 @@ class MaliciousPackageStore {
     // runSyncCycle() manually with no background interference. Always true
     // in production.
     this._autoSchedule = options.autoSchedule ?? true;
+
+    // Test-only: real process.exit() would kill the whole test runner the
+    // moment a test exercises the "stored data is newer than this code"
+    // path in _warmStart() -- injectable so tests can observe the call
+    // instead of actually terminating.
+    this._exitProcess = options.exitProcess ?? (code => process.exit(code));
 
     // Exposed so tests can await deterministic warm-start completion; never
     // awaited in production -- Verdaccio's loader does not await plugin
@@ -297,6 +360,8 @@ class MaliciousPackageStore {
           cveId: cve.cveId,
           severity: cve.severity,
           cweIds: cve.cweIds,
+          cvss3Score: cve.cvss3Score,
+          cvss4Score: cve.cvss4Score,
         };
       }
     }
@@ -327,14 +392,21 @@ class MaliciousPackageStore {
     return false;
   }
 
-  // OR at the top level: the global severity gate, or a CWE-specific gate.
-  // A bare osv.cve.cwe entry (empty severities array) matches at ANY
-  // severity, overriding the global list for that CWE; a non-empty
-  // severities array on a CWE entry replaces the global list for that CWE
-  // rather than being combined with it.
+  // OR across every configured dimension: the global severity gate, a
+  // CWE-specific gate, or either CVSS score minimum. A bare osv.cve.cwe
+  // entry (empty severities array) matches at ANY severity, overriding the
+  // global list for that CWE; a non-empty severities array on a CWE entry
+  // replaces the global list for that CWE rather than being combined with
+  // it. cvss3Min/cvss4Min are independent of each other and of
+  // severity/cwe -- same "either alone is sufficient to block" principle.
   _cveMatchesFilters(cve) {
-    if (this.cveSeverities.length === 0 && this.cweRules.size === 0)
-      return false; // both disabled
+    if (
+      this.cveSeverities.length === 0 &&
+      this.cweRules.size === 0 &&
+      this.cvss3Min == null &&
+      this.cvss4Min == null
+    )
+      return false; // everything disabled
     if (cve.severity && this.cveSeverities.includes(cve.severity)) return true;
     for (const cweId of cve.cweIds ?? []) {
       if (!this.cweRules.has(cweId)) continue;
@@ -342,23 +414,84 @@ class MaliciousPackageStore {
       if (severities.length === 0) return true; // bare -- any severity
       if (cve.severity && severities.includes(cve.severity)) return true;
     }
+    if (
+      this.cvss3Min != null &&
+      cve.cvss3Score != null &&
+      cve.cvss3Score >= this.cvss3Min
+    )
+      return true;
+    if (
+      this.cvss4Min != null &&
+      cve.cvss4Score != null &&
+      cve.cvss4Score >= this.cvss4Min
+    )
+      return true;
     return false;
   }
 
   // Full scan over the whole backend, run once at construction so a
   // freshly-started/newly-scaled pod doesn't have to wait for a full poll
   // cycle before OSV-based blocking is active.
+  //
+  // Guards against a schema mismatch: modified_id.csv's watermark only
+  // tells us whether OSV's *data* changed, never whether this plugin's own
+  // extraction logic did -- an older version's stored items (e.g.
+  // uppercase severity, no cvss3Score/cvss4Score, a last_affected range
+  // silently treated as unbounded) would otherwise sit there uncorrected
+  // indefinitely, only ever fixed by coincidence if that specific advisory
+  // happens to receive a fresh OSV-side update. Direction matters here,
+  // unlike the mid-operation check in runSyncCycle():
+  //  - missing/older stored version: this pod is the newer code arriving
+  //    to find older or no data -- self-heal via a full re-bootstrap.
+  //    Existing items are deliberately left unloaded in the meantime -- an
+  //    empty in-memory blocklist until bootstrap completes is the same
+  //    accepted gap as any other fresh pod start, and safer than serving
+  //    data this version can't fully trust.
+  //  - newer stored version: this pod is stale code starting up *after*
+  //    something newer already took over -- it has no correct way to
+  //    interpret the current shape, so it refuses to start at all rather
+  //    than run (or worse, write) in a degraded state that would only look
+  //    healthy from the outside.
   async _warmStart() {
     const items = await this.store.scanAll();
-    for (const item of items) {
-      if (item.pk === SYNC_STATE_KEY) {
-        this._bootstrapCompletedAt = item.bootstrapCompletedAt ?? null;
-        this._lastSyncedModifiedId = item.lastSyncedModifiedId ?? null;
-        this._csvEtag = item.csvEtag ?? null;
-        this._csvLastModified = item.csvLastModified ?? null;
-      } else {
-        this._applyToMemory(item);
+    const stateItem = items.find(item => item.pk === SYNC_STATE_KEY);
+    const cmp = compareSchemaVersion(stateItem?.extractionSchemaVersion);
+
+    if (cmp === 1) {
+      this.logger.fatal(
+        {
+          storedVersion: stateItem.extractionSchemaVersion,
+          currentVersion: osvClient.EXTRACTION_SCHEMA_VERSION,
+        },
+        'security-filter: osv -- stored data was written by a NEWER extraction schema (@{storedVersion} > @{currentVersion}) than this pod is running -- refusing to start',
+      );
+      this._exitProcess(1);
+      return; // real process.exit() never returns; this only matters for the injected test double
+    }
+
+    if (cmp === 0) {
+      this._bootstrapCompletedAt = stateItem.bootstrapCompletedAt ?? null;
+      this._lastSyncedModifiedId = stateItem.lastSyncedModifiedId ?? null;
+      this._csvEtag = stateItem.csvEtag ?? null;
+      this._csvLastModified = stateItem.csvLastModified ?? null;
+      for (const item of items) {
+        if (item.pk !== SYNC_STATE_KEY) this._applyToMemory(item);
       }
+      return;
+    }
+
+    // cmp === -1: missing or older -- self-heal via a full re-bootstrap.
+    // _bootstrapCompletedAt/_lastSyncedModifiedId/_csvEtag/_csvLastModified
+    // are already null from the constructor -- left untouched here so the
+    // next runSyncCycle() takes the bootstrap branch.
+    if (stateItem) {
+      this.logger.warn(
+        {
+          storedVersion: stateItem.extractionSchemaVersion ?? '(none)',
+          currentVersion: osvClient.EXTRACTION_SCHEMA_VERSION,
+        },
+        'security-filter: osv -- stored data was written by an older extraction schema (@{storedVersion} vs @{currentVersion}), forcing a full re-bootstrap',
+      );
     }
   }
 
@@ -398,7 +531,26 @@ class MaliciousPackageStore {
     this._timer.unref?.(); // don't keep the process (or a test run) alive solely for this timer
   }
 
+  // One version check per cycle, not one per package -- a race with some
+  // other, already-upgraded instance mid-cycle is unlikely, and even if it
+  // happens the affected package(s) either get retried next cycle
+  // (incremental) or get overwritten again once a bulk resync elsewhere
+  // finishes (which runs slower than an incremental cycle anyway, so it's
+  // still the one that lands last). Not worth a getItem() per package to
+  // guard against.
   async runSyncCycle() {
+    const stateItem = await this.store.getItem(SYNC_STATE_KEY);
+    if (compareSchemaVersion(stateItem?.extractionSchemaVersion) === 1) {
+      this.logger.warn(
+        {
+          storedVersion: stateItem.extractionSchemaVersion,
+          currentVersion: osvClient.EXTRACTION_SCHEMA_VERSION,
+        },
+        'security-filter: osv -- shared state has moved to a newer extraction schema (@{storedVersion} > @{currentVersion}) since this pod started -- skipping this sync cycle',
+      );
+      return;
+    }
+
     if (!this._bootstrapCompletedAt) {
       this._bootstrapAttempt += 1;
       await this._runBootstrap();
@@ -451,6 +603,8 @@ class MaliciousPackageStore {
               cveId: record.cveId,
               severity: record.severity,
               cweIds: record.cweIds,
+              cvss3Score: record.cvss3Score,
+              cvss4Score: record.cvss4Score,
               ranges: pkg.ranges,
               versions: pkg.versions,
             });
@@ -586,6 +740,8 @@ class MaliciousPackageStore {
                     cveId: record.cveId,
                     severity: record.severity,
                     cweIds: record.cweIds,
+                    cvss3Score: record.cvss3Score,
+                    cvss4Score: record.cvss4Score,
                     ranges: pkg.ranges,
                     versions: pkg.versions,
                   },
@@ -828,6 +984,7 @@ class MaliciousPackageStore {
       csvEtag: this._csvEtag,
       csvLastModified: this._csvLastModified,
       bootstrapCompletedAt: this._bootstrapCompletedAt,
+      extractionSchemaVersion: osvClient.EXTRACTION_SCHEMA_VERSION,
       updatedAt: new Date().toISOString(),
     });
   }

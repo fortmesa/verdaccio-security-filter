@@ -50,6 +50,8 @@ filters:
       cve:
         severity: []
         cwe: []
+        cvss3Min: null
+        cvss4Min: null
 ```
 
 There's no separate skip-list for the age check -- a package that needs to
@@ -108,11 +110,16 @@ if both are set, the more restrictive (earlier) one is the one that actually
 applies. `thresholdDate` accepts either a bare date (`"2026-01-01"`, interpreted
 as UTC midnight) or a full ISO-8601 timestamp (`"2026-01-01T00:00:00Z"`).
 
-**Pattern matching** follows Verdaccio's own `packages:` matching convention: an
-exact string like `"left-pad"` matches only that package; a trailing-`*` pattern
-like `"@known-bad-scope/*"` matches anything with that prefix (not the bare
-scope itself -- `"@evil/*"` does _not_ match a package literally named `@evil`,
-since that's not a real installable package name anyway); `"**"` matches every
+**Pattern matching uses real `minimatch`** -- the same convention Verdaccio's
+own `packages:` access-control config uses (via `@verdaccio/utils`'s
+`getMatchedPackagesSpec`), not a narrower hand-rolled matcher, and the same
+convention every plugin in this family (see `verdaccio-attestations`) matches
+package names with: an exact string like `"left-pad"` matches only that package;
+a trailing-`*` pattern like `"@known-bad-scope/*"` matches anything with that
+prefix, but (as a real minimatch `*`) never crosses a `/` -- not that this
+matters for a real npm package name, which is never more than one scope segment
+deep, so `"@evil/*"` still does _not_ match a package literally named `@evil`,
+since that's not a real installable package name anyway; `"**"` matches every
 package. An optional `versions` field (only available via the single-key object
 form) scopes a rule to a semver range. Multiple rules can match the same
 version; for `block:`, `strategy: replace` only applies if _every_ matching rule
@@ -239,6 +246,34 @@ permissions for `Scan`/`GetItem`/`PutItem`/`DeleteItem`/`BatchWriteItem` on it.
 section does anything until both the infrastructure exists and the config is
 turned on deliberately.
 
+## Extraction schema versioning
+
+`modified_id.csv`'s watermark only tracks whether OSV's _data_ changed -- never
+whether this plugin's own interpretation of it did. A change to the extraction
+logic itself can mean already-stored data is stale/incomplete in a way no amount
+of waiting for OSV-side updates would ever fix. Every extraction-affecting
+change bumps an internal `EXTRACTION_SCHEMA_VERSION` constant (`osv-client.js`),
+stamped onto the shared sync-state record on every successful bootstrap/sync.
+Direction matters:
+
+- **Stored version missing or older than this pod's code**: normal upgrade path
+  -- treated as never-bootstrapped, so the next cycle runs a full re-bootstrap
+  against the current code. The in-memory blocklist is left empty in the
+  meantime, the same accepted gap as any fresh pod start.
+- **Stored version newer than this pod's code**: this pod is stale code starting
+  up after something newer already took over -- it refuses to start
+  (`process.exit(1)`) rather than run in a degraded state, since it has no
+  correct way to interpret the current data shape.
+- **Mid-operation, during a rolling deploy**: an already-running pod re-checks
+  the shared version once per sync cycle (not once per package) before doing any
+  write. If the shared state has since moved forward, that pod sits the cycle
+  out rather than writing under a schema its own code no longer matches, but
+  keeps serving reads fine from its already-loaded data.
+
+Upgrading from no version marker at all (this mechanism's first-ever deploy) is
+handled operationally, not automatically -- scale to a single replica for that
+one transition.
+
 ## MAL confidence filtering
 
 Not every `MAL-` advisory carries the same confidence signal. Each one carries
@@ -278,27 +313,45 @@ separate from the `MAL-` (confirmed-malicious) feed: several thousand `GHSA-`
 records. `database_specific.severity` (`LOW`/`MODERATE`/`HIGH`/`CRITICAL`) and
 `database_specific.cwe_ids[]` are present on the large majority of non-withdrawn
 records; a `CVE-*` alias is present on most but not all (the rest are GHSA-only,
-no CVE ever assigned). The raw CVSS vector is **not** a precomputed number --
-filtering on it would require parsing the vector, which this plugin doesn't do,
-so severity bucket and CWE id are the fields actually filtered on. This reuses
-the same sync machinery as the `MAL-` feed (bootstrap + incremental via
-`modified_id.csv`
+no CVE ever assigned). This reuses the same sync machinery as the `MAL-` feed
+(bootstrap + incremental via `modified_id.csv`
 
 - withdrawal handling) since both record types live in the same feed already
   being polled.
+
+**Severity casing**: OSV's own bucket is uppercase; this plugin normalizes it to
+lowercase (`low`/`moderate`/`high`/`critical`) at extraction time, to match
+npm/yarn's own audit wire format rather than OSV's native casing.
+`osv.cve.severity`/the per-CWE severity lists in `osv.cve.cwe` accept either
+case in config -- both are normalized to lowercase before comparison, so
+existing uppercase config keeps working unchanged.
+
+**Range boundaries**: OSV's schema defines two mutually-exclusive ways a range
+expresses its upper bound -- `fixed` (exclusive: versions >= fixed are safe) and
+`last_affected` (inclusive: "versions above `last_affected` should be considered
+unaffected"). Both are handled correctly. A small number of records carry
+neither structured event, only a free-text, non-standard
+`database_specific.last_known_affected_version_range` field (used when GHSA
+never got a version with a real fix, e.g. `xlsx`) -- this is parsed on a
+best-effort basis for simple `<`/`<=` forms only; anything more complex is left
+unparsed and the range stays open, the same fail-closed behavior as any other
+unparseable bound.
 
 ```yaml
 filters:
   '@fortmesa/verdaccio-security-filter':
     osv:
       cve:
-        severity: [] # e.g. [HIGH, CRITICAL] -- blocks any CVE at these severities, any CWE
-        cwe: [] # e.g. [CWE-79, {CWE-506: [CRITICAL, HIGH]}, CWE-555]
+        severity: [] # e.g. [high, critical] -- blocks any CVE at these severities, any CWE
+        cwe: [] # e.g. [CWE-79, {CWE-506: [critical, high]}, CWE-555]
+        cvss3Min: null # e.g. 7.0 -- blocks any CVE with a computed CVSS v3.1 base score >= this
+        cvss4Min: null # e.g. 7.0 -- blocks any CVE with a computed CVSS v4.0 base score >= this
 ```
 
-Both default to `[]` (disabled) -- CVE data is still synced whenever
-`osv.enabled: true` (there's no separate enable flag, since it's the same feed),
-but CVE-based blocking is inert until one of these is populated.
+All four default to disabled (`[]`/`null`) -- CVE data (including CVSS scores)
+is still computed and synced whenever `osv.enabled: true` (there's no separate
+enable flag, since it's the same feed), but CVE-based blocking is inert until at
+least one of these is populated.
 
 **`osv.cve.severity`** blocks any CVE at the listed severities, regardless of
 CWE.
@@ -334,14 +387,28 @@ is just the readable config surface. The same CWE id must not appear more than
 once across the list (whether bare, keyed, or both) -- this is checked
 explicitly and fails loud at startup if violated. `osv.cve.severity` entries and
 every severity inside an `osv.cve.cwe` entry must be one of
-`LOW`/`MODERATE`/`HIGH`/`CRITICAL` -- also checked at startup.
+`low`/`moderate`/`high`/`critical` (case-insensitive in config, normalized to
+lowercase before validation) -- also checked at startup.
+
+**`osv.cve.cvss3Min`/`osv.cve.cvss4Min`** block any CVE whose computed CVSS base
+score meets or exceeds the configured minimum, independent of each other and of
+severity/cwe -- same "either alone is sufficient to block" principle. Real npm
+GHSA data only ever carries CVSS v3.1 and/or v4.0 vectors (never v2 or v3.0) --
+the base score is computed once, at sync time, via the
+[`ae-cvss-calculator`](https://www.npmjs.com/package/ae-cvss-calculator) library
+rather than hand-rolled, since CVSS v4.0's scoring method is a MacroVector
+lookup table, not a simple formula. Kept as two independent fields internally,
+not collapsed into one -- `cvss3Min` only ever compares against a v3.1 score,
+`cvss4Min` only against a v4.0 score; a record missing one version's vector
+simply never matches that specific gate, with no fallback between them.
 
 **A package's MAL and CVE data coexist independently** -- a package can be both
 a confirmed-malicious `MAL-` package and separately have one or more tracked
 CVEs (rare, but not prevented). `check()` evaluates the MAL dimension first
 (gated by `osv.malware.minOrigin`/`osv.malware.sources`), then any CVE entries
-(gated by `osv.cve.severity`/`osv.cve.cwe`) -- either alone is sufficient to
-block a version.
+(gated by
+`osv.cve.severity`/`osv.cve.cwe`/`osv.cve.cvss3Min`/`osv.cve.cvss4Min`) -- any
+one of these alone is sufficient to block a version.
 
 ## Storage backends
 
@@ -574,11 +641,16 @@ configured `webhook:` (see "Webhooks" above), if any.
 
 `semver` -- version-range matching for manual `block:`/`allow:` rules and OSV
 ranges, stable/prerelease detection, and sorting redirect/replace candidates.
+`minimatch` -- `block:`/`allow:` pattern matching, the same convention Verdaccio
+core (and every other plugin in this family) uses for package-name matching.
 `body-parser` -- used only by the publish-time gates, to parse the request body
 ahead of Verdaccio's own parsing; unused when both `blockPublishWithNewScripts`
 and `blockPublishMatches` are left at their default `false`. `yauzl` -- streams
 the OSV bootstrap zip without holding the whole archive decompressed in memory
-at once.
+at once. `ae-cvss-calculator` -- computes CVSS v3.1/v4.0 base scores for
+`osv.cve.cvss3Min`/`cvss4Min` (see "CVE (GHSA) blocking" above); a regular
+dependency, not an optional peer, since CVE data (including scores) is always
+computed at sync time whenever `osv.enabled: true`, the same as severity/CWE.
 
 `@aws-sdk/client-dynamodb`, `@aws-sdk/lib-dynamodb`, and `ioredis` are
 **optional peer dependencies** (see [Storage backends](#storage-backends)
