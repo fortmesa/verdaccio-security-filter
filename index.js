@@ -1,6 +1,20 @@
 'use strict';
 
 const semver = require('semver');
+// Pinned to 1.x deliberately -- DO NOT bump to 2.x. Verdaccio's own core
+// publish handler still bundles body-parser@1.20.5 internally, and 1.x/2.x
+// don't safely chain: 1.x's read() flags an already-consumed request via an
+// explicit req._body flag set synchronously; 2.x instead checks
+// onFinished.isFinished(req), an async/event-based signal that can still
+// read false immediately after a *different* body-parser instance already
+// fully drained the stream. Confirmed by direct repro (chaining this
+// plugin's own bodyParser.json() ahead of Verdaccio's bundled 1.x instance
+// on one real request): 1-then-1 and 2-then-2 both work, but 2-then-1 fails
+// every time with "stream is not readable" -- silently breaking every
+// publish once this middleware's own parser has already run (see also
+// verdaccio-attestations' own middleware, which shares this exact
+// constraint). Only safe to upgrade this once Verdaccio's own bundled
+// body-parser also moves to 2.x.
 const bodyParser = require('body-parser');
 const {minimatch} = require('minimatch');
 const {getAdvisoryStore} = require('./malicious-packages');
