@@ -22,8 +22,6 @@
 // node_modules itself uses) handles both without needing to know which
 // client sent it.
 
-const {versionSatisfies} = require('./malicious-packages');
-
 const KNOWN_SEVERITIES = new Set([
   'info',
   'low',
@@ -102,8 +100,11 @@ function resolveInChain(scopeChain, name) {
 
 // Walks the submitted tree/graph from every top-level dependency, recording
 // every (package, version, path) occurrence actually reachable -- then
-// checks each one against the real, unfiltered CVE store (getCveAdvisories,
-// same source advisories/bulk uses) exactly the way a real install would.
+// checks each one against the real CVE store (getCveAdvisories, same
+// source advisories/bulk uses -- both require the occurrence's own actual
+// version(s) and filter by them, so neither can report a CVE whose
+// vulnerableVersions range doesn't actually cover what's installed) exactly
+// the way a real install would.
 function findVulnerableOccurrences(
   dependencies,
   topLevelNames,
@@ -113,13 +114,8 @@ function findVulnerableOccurrences(
   const visitedPaths = new Set(); // bounds revisits on graphs with shared subtrees
 
   function recordHit(name, version, dev, path) {
-    const cves = maliciousPackageStore?.getCveAdvisories(name) ?? [];
+    const cves = maliciousPackageStore?.getCveAdvisories(name, [version]) ?? [];
     for (const cve of cves) {
-      if (
-        !cve.vulnerableVersions ||
-        !versionSatisfies(version, cve.vulnerableVersions)
-      )
-        continue;
       if (!hitsByPackage.has(name)) hitsByPackage.set(name, new Map());
       const byCve = hitsByPackage.get(name);
       if (!byCve.has(cve.id)) byCve.set(cve.id, {cve, occurrences: []});

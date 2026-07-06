@@ -11,11 +11,25 @@
 
 const assert = require('node:assert/strict');
 const {buildLegacyAuditReport} = require('../legacy-audit.js');
+const {versionSatisfies} = require('../malicious-packages.js');
 
+// Mirrors the real MaliciousPackageStore#getCveAdvisories() contract exactly
+// (required non-empty versions array, filtered by versionSatisfies) -- a
+// fake that didn't filter here would let this file's own tests pass
+// without ever exercising findVulnerableOccurrences()'s reliance on that
+// filtering actually happening, the same gap that let a real version-
+// filtering bug ship in the real store once.
 function fakeStore(cvesByPackage) {
   return {
-    getCveAdvisories(name) {
-      return cvesByPackage[name] ?? [];
+    getCveAdvisories(name, versions) {
+      assert.ok(
+        Array.isArray(versions) && versions.length > 0,
+        'getCveAdvisories() must always be called with a non-empty versions array',
+      );
+      const cves = cvesByPackage[name] ?? [];
+      return cves.filter(cve =>
+        versions.some(v => versionSatisfies(v, cve.vulnerableVersions)),
+      );
     },
   };
 }

@@ -311,18 +311,38 @@ class MaliciousPackageStore {
     }
   }
 
-  // For the advisories/bulk endpoint (index.js) -- deliberately UNFILTERED
-  // by osv.cve.severity/osv.cve.cwe/etc, unlike check() below. npm audit/
-  // yarn npm audit exist to inform developers of everything OSV actually
-  // knows about, a fundamentally different job than this deployment's own
+  // For the advisories/bulk endpoint (index.js) and the legacy audits
+  // endpoint (legacy-audit.js) -- deliberately UNFILTERED by
+  // osv.cve.severity/osv.cve.cwe/etc, unlike check() below. npm audit/yarn
+  // npm audit exist to inform developers of everything OSV actually knows
+  // about, a fundamentally different job than this deployment's own
   // auto-block policy -- a low-severity CVE this operator hasn't configured
   // to block is still real, useful information for `npm audit` to surface.
+  //
+  // `versions` is REQUIRED, not optional, on purpose: a real production bug
+  // (caught via a live registry reporting verdaccio itself as vulnerable to
+  // CVE-2019-14772, whose vulnerableVersions is "<3.12.0", while the
+  // actually-installed version was 6.7.4) was this method returning every
+  // CVE a package has EVER had regardless of which version is actually in
+  // use. Requiring the caller's own version(s) here, and filtering by them
+  // the same way check() already does via _cveVersionAffected, makes that
+  // specific mistake impossible to reintroduce silently -- forgetting to
+  // pass versions is now a thrown error, not a quietly-wrong result.
+  //
   // MAL (malicious-package) entries are deliberately excluded here --
   // representing one as a synthetic npm advisory needs its own dedicated
   // real npm/yarn/pnpm compatibility testing before it's included (see
   // docs/configuration.md's "Audit / advisory endpoints" section).
-  getCveAdvisories(name) {
-    return this._blocklist.get(name)?.cves ?? [];
+  getCveAdvisories(name, versions) {
+    if (!Array.isArray(versions) || versions.length === 0) {
+      throw new Error(
+        'security-filter: getCveAdvisories() requires a non-empty versions array',
+      );
+    }
+    const cves = this._blocklist.get(name)?.cves ?? [];
+    return cves.filter(cve =>
+      versions.some(v => this._cveVersionAffected(v, cve)),
+    );
   }
 
   // Hot path: zero network/storage calls, a plain Map lookup plus a small

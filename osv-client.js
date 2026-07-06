@@ -448,4 +448,11 @@ module.exports = {
   fetchModifiedCsv,
   fetchRecord,
   EXTRACTION_SCHEMA_VERSION,
+  // Exported for direct unit testing of the OSV-range-conversion pipeline --
+  // otherwise only reachable indirectly through a full extractCveRecord()/
+  // extractMalRecord() call. See test/smoke-version-matching.js.
+  normalizeRanges,
+  rangeToSemverClause,
+  toVulnerableVersions,
+  parseLastKnownAffectedVersionRange,
 };

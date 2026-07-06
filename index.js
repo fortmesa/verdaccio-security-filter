@@ -472,8 +472,23 @@ class SecurityFilter {
           req.body && typeof req.body === 'object' ? req.body : {};
         const result = {};
         for (const packageName of Object.keys(requested)) {
+          // Real advisories/bulk requests send {name: [version, ...]} --
+          // the client's own actually-installed version(s), not a range.
+          // Skipping when this isn't a non-empty array (rather than passing
+          // it through and letting getCveAdvisories() throw) keeps a
+          // malformed/empty entry a silent no-op here, matching this
+          // route's overall honest-empty-result posture for anything it
+          // can't make sense of, same as legacy-audit.js's own handling of
+          // a malformed body.
+          const versions = Array.isArray(requested[packageName])
+            ? requested[packageName]
+            : [];
+          if (versions.length === 0) continue;
           const cves =
-            this.maliciousPackageStore?.getCveAdvisories(packageName) ?? [];
+            this.maliciousPackageStore?.getCveAdvisories(
+              packageName,
+              versions,
+            ) ?? [];
           if (cves.length === 0) continue;
           result[packageName] = cves.map(cve =>
             cveToNpmAdvisory(packageName, cve),
