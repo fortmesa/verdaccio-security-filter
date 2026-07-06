@@ -62,44 +62,21 @@ function pickStorageKind(config) {
   );
 }
 
-// A whole-package block is just a range of {introduced:"0", fixed:null,
-// lastAffected:null} -- no separate code path is needed for "whole package"
-// vs "specific versions," this is the only matcher either case ever goes
-// through. Unparseable bounds fail closed toward *more* blocking (an
-// unparseable `fixed`/`lastAffected` doesn't exempt anything above it, an
-// unparseable `introduced` doesn't exempt anything below it), matching this
-// plugin's existing "unknown -> block" philosophy elsewhere (e.g. an
-// unknown publish date). A range with neither `fixed` nor `lastAffected`
-// set (still open, no known fix) matches everything from `introduced`
-// onward, forever -- same fail-closed principle.
-//
-// `fixed` and `lastAffected` use different upper-bound semantics per the
-// OSV schema -- `fixed` is exclusive, `lastAffected` is inclusive -- and
-// osv-client.js's normalizeRanges() guarantees at most one of the two is
-// ever set on a given range (the schema forbids both appearing together),
-// so checking `fixed` first and falling back to `lastAffected` never
-// discards real data.
-function versionMatchesRanges(version, ranges) {
+// vulnerableVersions is a real semver range string, precomputed ONCE at
+// import time by osv-client.js's toVulnerableVersions() -- the exact same
+// fail-closed boundary handling that used to live here (an unparseable
+// bound is omitted rather than embedded as a literal invalid clause) now
+// happens once there, not on every single check. A whole-package block is
+// just a "*" range -- no separate code path for "whole package" vs
+// "specific versions". `includePrerelease: true` because OSV ranges are
+// meant to also catch prerelease versions of an affected line, which plain
+// semver.satisfies() otherwise excludes from a range with no prerelease
+// tag of its own.
+function versionSatisfies(version, vulnerableVersions) {
   const parsed = semver.valid(version) ?? semver.valid(semver.coerce(version));
   if (!parsed) return true; // can't parse the version of an already-flagged package -- fail closed
-
-  return ranges.some(({introduced, fixed, lastAffected}) => {
-    const lower =
-      introduced === '0'
-        ? null
-        : (semver.valid(introduced) ?? semver.valid(semver.coerce(introduced)));
-    if (lower != null && semver.lt(parsed, lower)) return false;
-
-    if (fixed != null) {
-      const upper = semver.valid(fixed) ?? semver.valid(semver.coerce(fixed));
-      return upper == null || semver.lt(parsed, upper);
-    }
-    if (lastAffected != null) {
-      const upper =
-        semver.valid(lastAffected) ?? semver.valid(semver.coerce(lastAffected));
-      return upper == null || semver.lte(parsed, upper);
-    }
-    return true; // no upper bound at all -- matches everything from introduced onward
+  return semver.satisfies(parsed, vulnerableVersions, {
+    includePrerelease: true,
   });
 }
 
@@ -334,6 +311,20 @@ class MaliciousPackageStore {
     }
   }
 
+  // For the advisories/bulk endpoint (index.js) -- deliberately UNFILTERED
+  // by osv.cve.severity/osv.cve.cwe/etc, unlike check() below. npm audit/
+  // yarn npm audit exist to inform developers of everything OSV actually
+  // knows about, a fundamentally different job than this deployment's own
+  // auto-block policy -- a low-severity CVE this operator hasn't configured
+  // to block is still real, useful information for `npm audit` to surface.
+  // MAL (malicious-package) entries are deliberately excluded here --
+  // representing one as a synthetic npm advisory needs its own dedicated
+  // real npm/yarn/pnpm compatibility testing before it's included (see
+  // docs/configuration.md's "Audit / advisory endpoints" section).
+  getCveAdvisories(name) {
+    return this._blocklist.get(name)?.cves ?? [];
+  }
+
   // Hot path: zero network/storage calls, a plain Map lookup plus a small
   // semver comparison. This is what filter_metadata()/the publish gate call
   // on every single request. Checks the MAL dimension first (gated by
@@ -344,8 +335,8 @@ class MaliciousPackageStore {
     if (!entry) return null;
 
     if (
-      entry.ranges &&
-      versionMatchesRanges(version, entry.ranges) &&
+      entry.vulnerableVersions &&
+      versionSatisfies(version, entry.vulnerableVersions) &&
       this._malPassesConfidenceFilters(entry)
     ) {
       return {type: 'mal', malIds: entry.malIds};
@@ -382,14 +373,14 @@ class MaliciousPackageStore {
     return true;
   }
 
-  // A CVE can affect a version via a semver range or an explicit versions
-  // list (or both, on records that mix the two forms across affected[]
-  // entries) -- either is sufficient.
+  // vulnerableVersions already folds in both the range-based and explicit
+  // exact-version forms a CVE record can mix across affected[] entries
+  // (see osv-client.js's toVulnerableVersions()) -- one check covers both.
   _cveVersionAffected(version, cve) {
-    if (cve.ranges?.length && versionMatchesRanges(version, cve.ranges))
-      return true;
-    if (cve.versions?.length && cve.versions.includes(version)) return true;
-    return false;
+    return (
+      !!cve.vulnerableVersions &&
+      versionSatisfies(version, cve.vulnerableVersions)
+    );
   }
 
   // OR across every configured dimension: the global severity gate, a
@@ -593,7 +584,7 @@ class MaliciousPackageStore {
         for (const pkg of record.packages) {
           const item = staging.get(pkg.name) ?? {pk: pkg.name};
           if (isMal) {
-            item.ranges = pkg.ranges;
+            item.vulnerableVersions = pkg.vulnerableVersions;
             item.malIds = [record.id];
             item.originCount = pkg.originCount;
             item.sources = pkg.sources;
@@ -605,8 +596,7 @@ class MaliciousPackageStore {
               cweIds: record.cweIds,
               cvss3Score: record.cvss3Score,
               cvss4Score: record.cvss4Score,
-              ranges: pkg.ranges,
-              versions: pkg.versions,
+              vulnerableVersions: pkg.vulnerableVersions,
             });
           }
           item.modified = record.modified;
@@ -729,7 +719,7 @@ class MaliciousPackageStore {
             pkg.name,
             isMal
               ? {
-                  ranges: pkg.ranges,
+                  vulnerableVersions: pkg.vulnerableVersions,
                   malIds: [record.id],
                   originCount: pkg.originCount,
                   sources: pkg.sources,
@@ -742,8 +732,7 @@ class MaliciousPackageStore {
                     cweIds: record.cweIds,
                     cvss3Score: record.cvss3Score,
                     cvss4Score: record.cvss4Score,
-                    ranges: pkg.ranges,
-                    versions: pkg.versions,
+                    vulnerableVersions: pkg.vulnerableVersions,
                   },
                 },
           );
@@ -811,7 +800,7 @@ class MaliciousPackageStore {
         .filter(c => c.id !== delta.cveEntry.id)
         .concat(delta.cveEntry);
     } else {
-      merged.ranges = delta.ranges;
+      merged.vulnerableVersions = delta.vulnerableVersions;
       merged.malIds = delta.malIds;
       merged.originCount = delta.originCount;
       merged.sources = delta.sources;
@@ -882,7 +871,8 @@ class MaliciousPackageStore {
             );
           } else {
             if (
-              !versionMatchesRanges(ver, delta.ranges ?? []) ||
+              !delta.vulnerableVersions ||
+              !versionSatisfies(ver, delta.vulnerableVersions) ||
               !this._malPassesConfidenceFilters(delta)
             )
               continue;
@@ -926,7 +916,7 @@ class MaliciousPackageStore {
         if (remainingIds.length > 0) {
           entry.malIds = remainingIds;
         } else {
-          delete entry.ranges;
+          delete entry.vulnerableVersions;
           delete entry.malIds;
           delete entry.originCount;
           delete entry.sources;
@@ -969,7 +959,8 @@ class MaliciousPackageStore {
   // never consults.
   _applyToMemory(item) {
     const entry = {};
-    if (item.ranges !== undefined) entry.ranges = item.ranges;
+    if (item.vulnerableVersions !== undefined)
+      entry.vulnerableVersions = item.vulnerableVersions;
     if (item.malIds !== undefined) entry.malIds = item.malIds;
     if (item.originCount !== undefined) entry.originCount = item.originCount;
     if (item.sources !== undefined) entry.sources = item.sources;
@@ -1011,6 +1002,6 @@ function _resetSharedStoreForTests() {
 module.exports = {
   getAdvisoryStore,
   MaliciousPackageStore,
-  versionMatchesRanges,
+  versionSatisfies,
   _resetSharedStoreForTests,
 };

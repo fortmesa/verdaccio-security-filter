@@ -19,6 +19,7 @@ const bodyParser = require('body-parser');
 const {minimatch} = require('minimatch');
 const {getAdvisoryStore} = require('./malicious-packages');
 const {sendWebhook} = require('./webhook');
+const {cveToNpmAdvisory, buildLegacyAuditReport} = require('./legacy-audit');
 
 // Must match this package's name: Verdaccio's plugin loader resolves a
 // scoped package name verbatim as the config key (no `verdaccio-` prefix
@@ -415,6 +416,16 @@ class SecurityFilter {
     return packageInfo;
   }
 
+  // This whole method only ever runs if this plugin is ALSO listed under
+  // `middlewares:` in config.yaml (Verdaccio only constructs a plugin's
+  // middleware-role instance, and so only ever calls this hook, for config
+  // sections that reference it there) -- the `filters:` role above is a
+  // separate instance, independent and unaffected either way. That's now
+  // true even for an operator who wants NOTHING but the advisories/bulk
+  // endpoint below: an empty `middlewares: {'@fortmesa/verdaccio-security-
+  // filter': {}}` section is enough to get it registered, no publish-gate
+  // flag required.
+  //
   // Publish-time gates: REJECT (not just hide) a publish that either
   // introduces a preinstall/install/postinstall script not present in any
   // version this registry already has stored for that package
@@ -423,11 +434,9 @@ class SecurityFilter {
   // target is an internal @fortmesa/* package or one that also proxies
   // reads to npmjs via '**'; both run on the publish path itself, before
   // storage, so they apply identically regardless of which `packages:`
-  // pattern the name matches.
-  //
-  // Requires this plugin to ALSO be listed under `middlewares:` in
-  // config.yaml with at least one of the two flags set true -- the
-  // `filters:` role above is independent and unaffected either way.
+  // pattern the name matches. Gated below on at least one of the two flags
+  // being true -- unlike advisories/bulk above, these have real
+  // side effects an operator must opt into explicitly.
   register_middlewares(app, auth, storage) {
     // Unconditional, regardless of the two flags below: this is the only
     // Verdaccio hook that ever receives a `storage` reference, and the OSV
@@ -435,6 +444,80 @@ class SecurityFilter {
     // _checkAgainstLocalStorage()) needs it independently of whether the
     // publish-time reject gates are also enabled here.
     this.maliciousPackageStore?.attachRegistryStorage?.(storage);
+
+    // Real npm/yarn `npm audit`/`yarn npm audit` protocol endpoint --
+    // registered unconditionally, regardless of the two publish-gate flags
+    // below or of osv.enabled (an unconfigured/disabled OSV store just
+    // means every lookup below comes back empty, same honest `{}` result
+    // as before real data existed). Confirmed directly why this route has
+    // to exist at all, valid response or not: npm's own `npm audit`
+    // degrades gracefully on a 404 (a clean, informative error, exit code
+    // 1), but yarn berry 4.x's `yarn npm audit` throws an uncaught
+    // exception and dumps a raw stack trace instead of failing gracefully.
+    //
+    // Unfiltered by this deployment's own osv.cve.* block-policy
+    // thresholds -- see getCveAdvisories()'s own comment for why. MAL
+    // (malicious-package) data is deliberately NOT included yet -- see
+    // docs/configuration.md's "Audit / advisory endpoints" section.
+    app.use((req, res, next) => {
+      if (
+        req.method !== 'POST' ||
+        req.path !== '/-/npm/v1/security/advisories/bulk'
+      ) {
+        return next();
+      }
+      this._parseJsonBody(req, res, err => {
+        if (err) return next(err);
+        const requested =
+          req.body && typeof req.body === 'object' ? req.body : {};
+        const result = {};
+        for (const packageName of Object.keys(requested)) {
+          const cves =
+            this.maliciousPackageStore?.getCveAdvisories(packageName) ?? [];
+          if (cves.length === 0) continue;
+          result[packageName] = cves.map(cve =>
+            cveToNpmAdvisory(packageName, cve),
+          );
+        }
+        res.status(200).json(result);
+      });
+    });
+
+    // Older /-/npm/v1/security/audits(/quick) protocol -- npm 6 and below
+    // have no concept of advisories/bulk at all (confirmed directly against
+    // npm 6's own lib/audit.js and lib/install/audit.js), and yarn 2.x/3.x's
+    // own `yarn npm audit` always calls /quick too (confirmed directly
+    // against real 2.4.3/3.8.7 bundles -- yarn 4.x is the only Berry major
+    // that actually uses advisories/bulk). Unlike bulk, the client submits
+    // its own full dependency tree/graph here rather than a flat {name:
+    // [versions]} map, so the real work is walking that tree -- see
+    // legacy-audit.js for how, and for why every remediation action is
+    // 'review' rather than an automatic 'update'/'install' recommendation.
+    // Same unconditional/unfiltered/no-MAL-yet posture as advisories/bulk
+    // above.
+    //
+    // yarn classic (1.x) is NOT covered by this route despite also calling
+    // an /audits endpoint -- confirmed directly (`yarn audit --verbose`)
+    // that it hardcodes its request to the real
+    // https://registry.yarnpkg.com/-/npm/v1/security/audits, ignoring
+    // whatever registry is actually configured. No route this plugin can
+    // register will ever be reached by it.
+    app.use((req, res, next) => {
+      if (
+        req.method !== 'POST' ||
+        (req.path !== '/-/npm/v1/security/audits' &&
+          req.path !== '/-/npm/v1/security/audits/quick')
+      ) {
+        return next();
+      }
+      this._parseJsonBody(req, res, err => {
+        if (err) return next(err);
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        res
+          .status(200)
+          .json(buildLegacyAuditReport(body, this.maliciousPackageStore));
+      });
+    });
 
     if (!this.blockPublishWithNewScripts && !this.blockPublishMatches) return;
 

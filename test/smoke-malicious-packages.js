@@ -502,12 +502,14 @@ async function main() {
           'modified',
           'originCount',
           'pk',
-          'ranges',
           'sources',
+          'vulnerableVersions',
         ]);
-        assert.deepEqual(stored.ranges, [
-          {introduced: '0', fixed: null, lastAffected: null},
-        ]);
+        assert.equal(
+          stored.vulnerableVersions,
+          '*',
+          'a whole-package block (introduced: "0", no fixed/lastAffected) is the "*" range',
+        );
       } finally {
         osv.server.close();
       }

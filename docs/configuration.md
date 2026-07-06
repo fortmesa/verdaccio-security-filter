@@ -555,6 +555,92 @@ stored. This is robust to either shape npm sends (just the new version, or the
 full merged set) and naturally leaves `npm deprecate`/`npm star` requests
 untouched, since neither introduces a version key that isn't already stored.
 
+## Audit / advisory endpoints
+
+Real `npm audit`/`yarn npm audit` support -- both the modern and legacy wire
+protocols, since different client majors use different ones and this plugin has
+no control over which one a given install picks:
+
+- `POST /-/npm/v1/security/advisories/bulk` -- npm 7+ and yarn berry 4.x.
+- `POST /-/npm/v1/security/audits` and `POST /-/npm/v1/security/audits/quick` --
+  npm 6 and yarn berry 2.x/3.x (`legacy-audit.js`). Confirmed directly against
+  each client's own source, not assumed: npm 7's own `@npmcli/arborist` tries
+  `advisories/bulk` first and only falls back to `audits/quick` if that request
+  itself fails; npm 6 and yarn 2.x/3.x have no concept of `advisories/bulk` at
+  all and call the older routes directly.
+
+Both are registered unconditionally in `register_middlewares()`, regardless of
+`blockPublishWithNewScripts`/`blockPublishMatches`/`osv.enabled` -- an
+unconfigured/disabled OSV store just means every lookup comes back empty, the
+same honest "nothing known" response as a real empty sync. **This still requires
+the plugin to be listed under `middlewares:`** (see "Publish-time gate" above
+for why that's a separate plugin instance from `filters:`) -- unlike the two
+publish-time gates, no flag needs to be set true for these routes to exist, but
+the section itself must be present:
+
+```yaml
+middlewares:
+  '@fortmesa/verdaccio-security-filter': {}
+```
+
+**Why register a route at all, even an empty one**: leaving it unregistered
+entirely (the alternative -- Verdaccio has no built-in route here unless its own
+bundled `verdaccio-audit` plugin is separately configured) causes a real,
+confirmed difference in client behavior on the resulting `404`: `npm audit`
+degrades gracefully (a clean, informative error, exit code `1`), but yarn berry
+4.x's `yarn npm audit` throws an uncaught exception and dumps a raw internal
+stack trace instead. A valid `200` response, populated or not, avoids that crash
+for every client.
+
+**Response content**: both routes reuse the same CVE data `osv.cve.*` blocking
+already computes (`vulnerableVersions`, severity, CWE ids, CVSS scores) --
+**unfiltered** by this deployment's own `osv.cve.*` thresholds, since
+`npm audit` exists to inform developers of everything known, independent of what
+this deployment has chosen to actually block. **MAL** (confirmed-malicious
+package) data is **not** included in either response yet -- serving it needs
+dedicated compatibility testing against real npm/yarn/pnpm tooling first, to
+confirm it doesn't break existing install/audit flows; deferred until that
+testing happens.
+
+**advisories/bulk** request/response is a flat `{name: [versions]}` in,
+`{name: [advisory, ...]}` out -- npm's own client-side
+`@npmcli/metavuln-calculator` `Advisory` class reads `id`/`severity` (defaults
+`high`)/`vulnerable_versions` (defaults `*`) directly off each entry.
+
+**audits(/quick)** is a materially different shape: the client submits its _own_
+full dependency tree/graph in the request (npm 6's shrinkwrap-derived nested
+tree, yarn berry's flat requires-graph -- both reduce to the same
+`{requires, dependencies}` structure at every level), and the server has to walk
+that submitted tree itself to find every occurrence of a flagged package, since
+there's no simple name-to-versions map to look up. Every remediation entry in
+the response's `actions` array is `action: 'review'`, never `update`/`install`
+-- internally, a CVE's affected-range data is stored as a single OR'd semver
+clause (`vulnerableVersions`), not a tracked first-patched-version, so there's
+no reliable upgrade target to recommend automatically; recommending manual
+review is the honest answer, not a placeholder for a harder feature. This does
+**not** weaken the actual report: exit codes and vulnerability counts for both
+routes are driven by `metadata.vulnerabilities` severity counts, which this
+plugin populates correctly regardless of `actions`.
+
+**yarn classic (1.x) cannot be reached by either route.** Confirmed directly
+(`yarn audit --verbose`): yarn classic's `audit` command hardcodes its request
+to the real `https://registry.yarnpkg.com/-/npm/v1/security/audits`, ignoring
+whatever registry is actually configured. No route this plugin registers will
+ever be reached by it -- this is a limitation of yarn classic itself, not
+something a server-side change can fix.
+
+**`npm audit fix`**: works correctly for npm 7-11 with no additional server-side
+support needed -- confirmed by reading `@npmcli/arborist`'s own `Vuln` class and
+by a live publish/pin/fix round-trip: the fix target is computed entirely
+client-side, combining the `vulnerable_versions` range this plugin serves with
+the package's real version list (fetched independently via the normal registry
+packument). For npm 6, `npm audit fix` is a safe no-op -- its own fix logic only
+acts on `update`/`install` actions, and this plugin only ever emits `review`
+actions (see above), so it correctly reports and exits without silently changing
+anything. **Yarn has no audit-fix equivalent to support at all** --
+`yarn npm audit --help` confirms Yarn Berry never implemented automatic audit
+remediation, on any major version.
+
 ## Webhooks
 
 A single, static, operator-configured webhook target -- fired for every "loud"

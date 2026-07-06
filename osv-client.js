@@ -10,6 +10,7 @@
 // -- see docs/plugins/security-filter.md's "Cost characteristics" section
 // for why that matters at ~220k current entries.
 
+const semver = require('semver');
 const yauzl = require('yauzl');
 const {Cvss3P1, Cvss4P0} = require('ae-cvss-calculator');
 
@@ -94,6 +95,51 @@ function normalizeRanges(affectedEntry) {
   return ranges;
 }
 
+// Converts one {introduced, fixed, lastAffected} triple into a real semver
+// range clause -- the ONLY place this conversion ever happens (once, at
+// import), so both this plugin's own matching (malicious-packages.js's
+// versionSatisfies(), a plain semver.satisfies() call) and the real
+// advisories/bulk client-facing response read the exact same precomputed
+// string. Replicates versionMatchesRanges()'s prior fail-closed semantics
+// exactly: an unparseable bound is OMITTED (never embedded as a literal
+// invalid range clause, which semver.satisfies() would just choke on) --
+// an unparseable `introduced` means no lower bound (matches from the very
+// start, same as the "0" sentinel), an unparseable `fixed`/`lastAffected`
+// means no upper bound (matches forever above `introduced`, same as a
+// still-open/unfixed range with neither field set).
+function rangeToSemverClause({introduced, fixed, lastAffected}) {
+  const parts = [];
+  const lower =
+    introduced === '0'
+      ? null
+      : (semver.valid(introduced) ?? semver.valid(semver.coerce(introduced)));
+  if (lower != null) parts.push(`>=${lower}`);
+
+  if (fixed != null) {
+    const upper = semver.valid(fixed) ?? semver.valid(semver.coerce(fixed));
+    if (upper != null) parts.push(`<${upper}`);
+  } else if (lastAffected != null) {
+    const upper =
+      semver.valid(lastAffected) ?? semver.valid(semver.coerce(lastAffected));
+    if (upper != null) parts.push(`<=${upper}`);
+  }
+
+  return parts.length > 0 ? parts.join(' ') : '*';
+}
+
+// Folds both a range triples array AND an explicit exact-versions list
+// (OSV's affected[].versions -- a bare version string is already a valid,
+// single-version semver range on its own) into ONE OR-joined semver range
+// string -- the single stored/matched-against/served representation for a
+// package's affected versions, replacing what used to be two separate
+// fields (`ranges` and `versions`) checked independently. Returns null only
+// if given nothing at all; every caller here already filters that case out
+// before calling this.
+function toVulnerableVersions(ranges, versions = []) {
+  const clauses = [...ranges.map(rangeToSemverClause), ...versions];
+  return clauses.length > 0 ? clauses.join(' || ') : null;
+}
+
 // Independent corroborating detectors that flagged a MAL- package (source +
 // advisory id + timestamps) -- only `source`, deduplicated, and the count
 // are ever kept; the rest (timestamps, per-origin sha256/ranges) is exactly
@@ -129,7 +175,7 @@ function extractMalRecord(raw) {
     modified: raw.modified,
     packages: Array.from(byPackage, ([name, ranges]) => ({
       name,
-      ranges,
+      vulnerableVersions: toVulnerableVersions(ranges),
       originCount,
       sources,
     })),
@@ -212,8 +258,7 @@ function extractCveRecord(raw) {
     cvss4Score,
     packages: Array.from(byPackage, ([name, {ranges, versions}]) => ({
       name,
-      ranges,
-      versions,
+      vulnerableVersions: toVulnerableVersions(ranges, versions),
     })),
   };
 }
