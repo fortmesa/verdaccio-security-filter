@@ -2,4 +2,20 @@ yarn install --immutable || {
   echo "yarn.lock is out of date with package.json -- run 'yarn install' and commit the result." >&2
   exit 1
 }
+
+# Best-effort local pre-flight: yarnstatic check verifies yarn.lock's
+# tarballs actually exist in S3 before CI's yarn-plugin-yarnstatic-s3 would
+# need them. Only a clean run that reports missing tarballs (exit 1) blocks
+# the commit -- no binary installed, no AWS credentials, no network, wrong
+# config, or any other error all pass through silently. This is a safety
+# net, not a hard requirement to have yarnstatic installed locally.
+if command -v yarnstatic >/dev/null 2>&1; then
+  YARNSTATIC_BUCKET=fmdev-npmjs-storage YARNSTATIC_KEY_PREFIX=verdaccio yarnstatic check
+  yarnstatic_code=$?
+  if [ "$yarnstatic_code" -eq 1 ]; then
+    echo "yarnstatic check: yarn.lock references package(s) missing from S3 -- fix before committing." >&2
+    exit 1
+  fi
+fi
+
 yarn lint-staged

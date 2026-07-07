@@ -42,44 +42,40 @@ jobs:
           role-to-assume: arn:aws:iam::869756787046:role/gha-install
           aws-region: us-east-1
 
-      # These are bare, unauthenticated `curl` calls -- they only work if
-      # fortmesa/yarnstatic is a PUBLIC repo. Confirmed empirically
-      # (2026-07): a private repo's release assets 404 on an unauthenticated
-      # request (GitHub returns 404, not 401/403, specifically so it
-      # doesn't leak the existence of private resources), regardless of
-      # whether the release/asset actually exists. If this step ever starts
-      # 404ing again, check that first before assuming the release itself
-      # is broken.
-      - name: Install yarnstatic (pinned + checksum-verified)
+      # yarn-plugin-yarnstatic-s3 talks to S3 directly, in-process, via
+      # Yarn's own wrapNetworkRequest hook and the AWS SDK -- no Go binary,
+      # no daemon, no Unix socket (unlike the sibling yarn-plugin-yarnstatic,
+      # which spawns `yarnstatic serve` and talks to it that way). Sourced
+      # from this org's own S3 storage via the role assumed above, not
+      # GitHub releases -- gha-install needs s3:GetObject on
+      # fmdev-npmjs-storage/fortmesa/yarnstatic/* for this step (separate
+      # from, and in addition to, its existing grant on verdaccio/* below).
+      # `yarn plugin import` on a local path copies the file into
+      # .yarn/plugins/ and registers it in .yarnrc.yml itself, so the
+      # downloaded copy can be deleted right after.
+      - name: Install yarn-plugin-yarnstatic-s3 (pinned + checksum-verified)
         env:
-          YARNSTATIC_VERSION: v1.0.1
+          YARNSTATIC_VERSION: v1.0.2
         run: |
           set -eu
-          # uname -m reflects the runner's actual architecture regardless of
-          # which runs-on label produced it, so this keeps working unmodified
-          # if this job ever moves to an arm64 runner -- no separate arm64
-          # case to remember to add elsewhere.
-          case "$(uname -m)" in
-            x86_64) ARCH=amd64 ;;
-            aarch64) ARCH=arm64 ;;
-            *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          ASSET="yarnstatic-linux-${ARCH}"
-          curl -fsSLo "$ASSET" "https://github.com/fortmesa/yarnstatic/releases/download/${YARNSTATIC_VERSION}/${ASSET}"
-          curl -fsSLo checksums.txt "https://github.com/fortmesa/yarnstatic/releases/download/${YARNSTATIC_VERSION}/checksums.txt"
-          grep " ${ASSET}\$" checksums.txt | sha256sum -c -
-          install -m 0755 "$ASSET" /usr/local/bin/yarnstatic
+          PREFIX="s3://fmdev-npmjs-storage/fortmesa/yarnstatic/${YARNSTATIC_VERSION}"
+          aws s3 cp "${PREFIX}/plugin-yarnstatic-s3.cjs" plugin-yarnstatic-s3.cjs
+          aws s3 cp "${PREFIX}/checksums.txt" checksums.txt
+          grep " plugin-yarnstatic-s3.cjs\$" checksums.txt | sha256sum -c -
+          yarn plugin import ./plugin-yarnstatic-s3.cjs
+          rm plugin-yarnstatic-s3.cjs checksums.txt
 
       # Zero live-registry network access -- tarballs come from the
-      # registry's own S3 storage via the role assumed above, not
-      # npmjs.dev.fort.blue itself.
+      # registry's own S3 storage via yarn-plugin-yarnstatic-s3 (in-process
+      # AWS SDK calls, using the role assumed above), not npmjs.dev.fort.blue
+      # itself. No "yarnstatic check" pre-flight step here -- that's the Go
+      # binary's separate offline lockfile-vs-S3 drift-detection subcommand,
+      # unrelated to the install-time fetch path this plugin replaces.
       - name: Install dependencies
         env:
           YARNSTATIC_BUCKET: fmdev-npmjs-storage
           YARNSTATIC_KEY_PREFIX: verdaccio
-        run: |
-          yarnstatic check
-          yarn install --immutable
+        run: yarn install --immutable
 
       # .yarn/install-state.gz travels with node_modules so Yarn recognizes
       # the tree as already-installed downstream and never tries an implicit
