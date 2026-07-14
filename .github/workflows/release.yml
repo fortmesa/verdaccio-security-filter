@@ -165,7 +165,7 @@ jobs:
           yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
 
       - name: Publish to npmjs.dev.fort.blue
-        run: yarn npm publish --access public
+        run: yarn npm publish --access public --provenance
 
   release:
     name: Create release

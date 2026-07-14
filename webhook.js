@@ -66,19 +66,35 @@ function sendWebhook(webhookConfig, data, logger) {
   if (body !== undefined) headers['Content-Length'] = Buffer.byteLength(body);
 
   const client = url.protocol === 'http:' ? http : https;
-  const req = client.request(
-    url,
-    {method: body !== undefined ? 'POST' : 'GET', headers, timeout: 10_000},
-    res => {
-      res.resume(); // drain and discard -- nothing downstream reads the response
-      if (res.statusCode >= 400) {
-        logger?.warn(
-          {url: url.toString(), status: res.statusCode},
-          'security-filter: webhook -- delivery got a non-2xx/3xx response (@{status})',
-        );
-      }
-    },
-  );
+  let req;
+  try {
+    // Node validates header values synchronously here and throws
+    // (TypeError [ERR_INVALID_CHAR]) if a substituted field (pkg/ver/reason/
+    // etc. -- any of which can carry attacker-controlled bytes, e.g. a raw
+    // CR/LF smuggled through a crafted package name or version key) put a
+    // CR or LF into a header value. Caught the same way an invalid `url`
+    // already is above: log and skip this one delivery, never crash the
+    // process over a malformed webhook payload.
+    req = client.request(
+      url,
+      {method: body !== undefined ? 'POST' : 'GET', headers, timeout: 10_000},
+      res => {
+        res.resume(); // drain and discard -- nothing downstream reads the response
+        if (res.statusCode >= 400) {
+          logger?.warn(
+            {url: url.toString(), status: res.statusCode},
+            'security-filter: webhook -- delivery got a non-2xx/3xx response (@{status})',
+          );
+        }
+      },
+    );
+  } catch (err) {
+    logger?.error(
+      {err: err.message},
+      'security-filter: webhook -- invalid header value after substitution, skipped',
+    );
+    return;
+  }
   req.on('timeout', () => req.destroy(new Error('webhook request timed out')));
   req.on('error', err => {
     logger?.warn(
