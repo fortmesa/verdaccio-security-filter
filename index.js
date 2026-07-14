@@ -20,6 +20,13 @@ const {minimatch} = require('minimatch');
 const {getAdvisoryStore} = require('./malicious-packages');
 const {sendWebhook} = require('./webhook');
 const {cveToNpmAdvisory, buildLegacyAuditReport} = require('./legacy-audit');
+const {
+  DEFAULT_SENSITIVE_PATHS,
+  findDirectSensitivePathTouch,
+  extractReferencedScriptFiles,
+  findIndirectSensitivePathTouch,
+  extractTarballFiles,
+} = require('./sensitive-paths');
 
 // Must match this package's name: Verdaccio's plugin loader resolves a
 // scoped package name verbatim as the config key (no `verdaccio-` prefix
@@ -120,6 +127,68 @@ function findSuspiciousScript(versionMeta) {
     if (!(key in scripts)) continue;
     const classified = classifySuspiciousScript(scripts[key]);
     if (classified) return {key, command: scripts[key], ...classified};
+  }
+  return null;
+}
+
+// Same shape/style as findSuspiciousScript() above, for the sensitive-path
+// touch check -- see sensitive-paths.js for the actual pattern matching.
+// `tarballFiles` (Map<relativePath, content>) is only ever populated at
+// publish time (see _checkPublish()'s own tarball extraction below);
+// filter_metadata() has no tarball to inspect, so it always passes null here,
+// which naturally limits it to the direct, command-text-only check.
+function findSensitivePathTouch(versionMeta, tarballFiles, paths) {
+  const scripts = versionMeta?.scripts ?? {};
+  for (const key of INSTALL_SCRIPTS) {
+    const command = scripts[key];
+    if (!command) continue;
+    const direct = findDirectSensitivePathTouch(command, paths);
+    if (direct) return {key, command, type: 'direct', matched: direct};
+    const indirect = findIndirectSensitivePathTouch(
+      command,
+      tarballFiles,
+      paths,
+    );
+    if (indirect)
+      return {
+        key,
+        command,
+        type: 'indirect',
+        matched: indirect.matched,
+        file: indirect.file,
+      };
+  }
+  return null;
+}
+
+// `paths` must be a non-empty-string array -- validated unconditionally (even
+// when sensitivePaths.enabled is false), matching every other config
+// validator in this file: a typo here should fail loud at startup, not
+// silently do nothing once an operator later flips enabled: true.
+function parseSensitivePaths(list) {
+  if (
+    !Array.isArray(list) ||
+    list.length === 0 ||
+    list.some(p => typeof p !== 'string' || p.length === 0)
+  ) {
+    throw new Error(
+      'security-filter: sensitivePaths.paths must be a non-empty array of non-empty strings',
+    );
+  }
+  return list;
+}
+
+// The publish request's own `_attachments` map keys the tarball by
+// `${packageName}-${version}.tgz` (confirmed directly against npm's own
+// publish payload construction, libnpmpublish's publish.js) -- tries every
+// version this request is actually adding, since in principle more than one
+// could be, though in practice npm/yarn only ever send one per publish.
+function getAttachmentBuffer(body, packageName, versions) {
+  const attachments = body?._attachments;
+  if (!attachments || typeof attachments !== 'object') return null;
+  for (const ver of versions) {
+    const attachment = attachments[`${packageName}-${ver}.tgz`];
+    if (attachment?.data) return Buffer.from(attachment.data, 'base64');
   }
   return null;
 }
@@ -302,6 +371,21 @@ class SecurityFilter {
     const scriptHeuristics = sharedConfig.scriptHeuristics ?? {};
     this.scriptHeuristicsEnabled = scriptHeuristics.enabled ?? false;
     this.blockShellPipe = scriptHeuristics.blockShellPipe ?? false;
+
+    // Sensitive-path touch -- an install script (directly, in its own command
+    // text, or indirectly, via a bundled file it invokes) referencing a
+    // credential/config/auto-run path it has no legitimate reason to touch.
+    // See sensitive-paths.js and docs/configuration.md's "Sensitive path
+    // touch" section. Same opt-in/second-gate shape as scriptHeuristics
+    // above: `enabled` alone only alerts (webhook + log); `block` also
+    // rejects the publish / hides the version, same as blockShellPipe does
+    // for the obfuscation heuristics.
+    const sensitivePathsConfig = sharedConfig.sensitivePaths ?? {};
+    this.sensitivePathsEnabled = sensitivePathsConfig.enabled ?? false;
+    this.blockSensitivePathTouch = sensitivePathsConfig.block ?? false;
+    this.sensitivePaths = parseSensitivePaths(
+      sensitivePathsConfig.paths ?? DEFAULT_SENSITIVE_PATHS,
+    );
 
     // Matches Verdaccio's own global JSON body limit (api/endpoint/index.js
     // uses the same `max_body_size || '10mb'` fallback) so this gate never
@@ -511,6 +595,43 @@ class SecurityFilter {
           }
         }
 
+        // 5d. Sensitive-path touch -- direct check only. There's no tarball
+        // to inspect at read time (only _checkPublish() ever sees the raw
+        // publish attachment), so the indirect, invoked-file check never
+        // fires here -- see findSensitivePathTouch()'s own comment. Same
+        // "log only, no webhook" posture as 5c above, for the same reason.
+        if (this.sensitivePathsEnabled) {
+          const hit = findSensitivePathTouch(
+            versions[ver],
+            null,
+            this.sensitivePaths,
+          );
+          if (hit) {
+            if (this.blockSensitivePathTouch) {
+              blocked.add(ver);
+              this.logger.error(
+                {
+                  pkg: packageInfo.name,
+                  ver,
+                  script: hit.key,
+                  matched: hit.matched,
+                },
+                'security-filter: blocked -- install script references sensitive path @{matched}',
+              );
+              continue;
+            }
+            this.logger.warn(
+              {
+                pkg: packageInfo.name,
+                ver,
+                script: hit.key,
+                matched: hit.matched,
+              },
+              'security-filter: install script references sensitive path @{matched}, not blocked',
+            );
+          }
+        }
+
         if (!isScripted) {
           seenCleanVersion = true;
         }
@@ -594,13 +715,14 @@ class SecurityFilter {
   // Publish-time gates: REJECT (not just hide) a publish that either
   // introduces a preinstall/install/postinstall script not present in any
   // version this registry already has stored for that package
-  // (blockPublishWithNewScripts), or matches the OSV malicious-package
-  // blocklist or a manual block: rule (blockPublishMatches) -- whether the
-  // target is an internal @fortmesa/* package or one that also proxies
-  // reads to npmjs via '**'; both run on the publish path itself, before
-  // storage, so they apply identically regardless of which `packages:`
-  // pattern the name matches. Gated below on at least one of the two flags
-  // being true -- unlike advisories/bulk above, these have real
+  // (blockPublishWithNewScripts), matches the OSV malicious-package
+  // blocklist or a manual block: rule (blockPublishMatches), or (with
+  // sensitivePaths.enabled) touches a credential/config/auto-run path --
+  // whether the target is an internal @fortmesa/* package or one that also
+  // proxies reads to npmjs via '**'; all three run on the publish path
+  // itself, before storage, so they apply identically regardless of which
+  // `packages:` pattern the name matches. Gated below on at least one of the
+  // three being true -- unlike advisories/bulk above, these have real
   // side effects an operator must opt into explicitly.
   register_middlewares(app, auth, storage) {
     // Unconditional, regardless of the two flags below: this is the only
@@ -699,7 +821,12 @@ class SecurityFilter {
       });
     });
 
-    if (!this.blockPublishWithNewScripts && !this.blockPublishMatches) return;
+    if (
+      !this.blockPublishWithNewScripts &&
+      !this.blockPublishMatches &&
+      !this.sensitivePathsEnabled
+    )
+      return;
 
     // Workaround for verdaccio/verdaccio#1912 (reported 2020, unfixed in
     // the currently-published @verdaccio/middleware -- see
@@ -811,7 +938,7 @@ class SecurityFilter {
       name: packageName,
       uplinksLook: false,
       req,
-      callback: (err, existing) => {
+      callback: async (err, existing) => {
         const existingVersions =
           !err && existing?.versions ? existing.versions : {};
         // Only versions this exact request would actually add -- robust to
@@ -926,6 +1053,143 @@ class SecurityFilter {
                 .status(403)
                 .json({error: 'forbidden', reason: ruleReason});
             }
+          }
+        }
+
+        // Sensitive-path touch -- see filter_metadata()'s own version of this
+        // check (5d) for the direct-only read-time equivalent; here, at
+        // publish time, the tarball attachment is also available, so a
+        // script that merely *invokes* another bundled file (rather than
+        // touching the sensitive path inline) is caught too. Same
+        // alert-vs-block shape as the obfuscation heuristics below --
+        // deliberately placed ahead of the blockPublishWithNewScripts gate
+        // just below, so `sensitivePaths.enabled` alone is enough to run
+        // this check, independent of that unrelated flag.
+        if (this.sensitivePathsEnabled) {
+          // Gather every locally-referenced script file across all new
+          // versions' install scripts up front, then do exactly one tarball
+          // parse for all of them -- extractTarballFiles() is the only place
+          // this plugin ever touches tarball bytes, gated entirely behind
+          // this opt-in flag.
+          const wantedFiles = new Set();
+          for (const ver of newVersionKeys) {
+            const scripts = incomingVersions[ver].scripts ?? {};
+            for (const key of INSTALL_SCRIPTS) {
+              for (const file of extractReferencedScriptFiles(scripts[key])) {
+                wantedFiles.add(file);
+              }
+            }
+          }
+
+          // Missing/unreadable attachment is a silent empty result, same
+          // "can't verify -- only the direct check still applies" degrade as
+          // filter_metadata()'s own read-time check.
+          let tarballFiles = null;
+          if (wantedFiles.size > 0) {
+            const attachmentBuffer = getAttachmentBuffer(
+              req.body,
+              packageName,
+              newVersionKeys,
+            );
+            if (attachmentBuffer) {
+              try {
+                tarballFiles = await extractTarballFiles(
+                  attachmentBuffer,
+                  wantedFiles,
+                );
+              } catch (err) {
+                this.logger.warn(
+                  {pkg: packageName, err: err.message},
+                  'security-filter: sensitivePaths -- failed to read tarball attachment, indirect check skipped',
+                );
+              }
+            }
+          }
+
+          const blockableVersion = newVersionKeys.find(v => {
+            if (findMatchingRules(this.allowRules, packageName, v).length > 0)
+              return false;
+            const hit = findSensitivePathTouch(
+              incomingVersions[v],
+              tarballFiles,
+              this.sensitivePaths,
+            );
+            return !!hit && this.blockSensitivePathTouch;
+          });
+
+          if (blockableVersion) {
+            const hit = findSensitivePathTouch(
+              incomingVersions[blockableVersion],
+              tarballFiles,
+              this.sensitivePaths,
+            );
+            const detail =
+              hit.type === 'direct'
+                ? `references ${hit.matched} directly`
+                : `invokes ${hit.file}, which itself references ${hit.matched}`;
+
+            this.logger.fatal(
+              {
+                pkg: packageName,
+                ver: blockableVersion,
+                user,
+                script: hit.key,
+                detail,
+              },
+              'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} install script @{detail} -- rejected',
+            );
+            const pathReason =
+              `SECURITY BLOCK: publish of ${packageName}@${blockableVersion} rejected -- its ${hit.key} ` +
+              `script ${detail}, a credential/config/auto-run path it has no legitimate reason to touch. ` +
+              'Contact a registry administrator if this is a false positive.';
+            sendWebhook(
+              this.webhookConfig,
+              {
+                event: 'publish_blocked_sensitive_path',
+                pkg: packageName,
+                ver: blockableVersion,
+                user,
+                detail,
+                reason: pathReason,
+              },
+              this.logger,
+            );
+            return res
+              .status(403)
+              .json({error: 'forbidden', reason: pathReason});
+          }
+
+          for (const ver of newVersionKeys) {
+            if (findMatchingRules(this.allowRules, packageName, ver).length > 0)
+              continue;
+            const hit = findSensitivePathTouch(
+              incomingVersions[ver],
+              tarballFiles,
+              this.sensitivePaths,
+            );
+            if (!hit) continue;
+
+            const detail =
+              hit.type === 'direct'
+                ? `references ${hit.matched} directly`
+                : `invokes ${hit.file}, which itself references ${hit.matched}`;
+            const alertReason = `${packageName}@${ver}'s ${hit.key} script ${detail} -- not blocked, review recommended.`;
+            this.logger.warn(
+              {pkg: packageName, ver, user, script: hit.key, detail},
+              'security-filter: publish install script @{detail}, not blocked',
+            );
+            sendWebhook(
+              this.webhookConfig,
+              {
+                event: 'publish_sensitive_path',
+                pkg: packageName,
+                ver,
+                user,
+                detail,
+                reason: alertReason,
+              },
+              this.logger,
+            );
           }
         }
 

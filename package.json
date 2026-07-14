@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/verdaccio-security-filter",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Verdaccio filter plugin: blocks versions that are too new, published after a date threshold, match a synced OSV malicious-package blocklist, match a manual block/allow list, or newly introduce install scripts, and (optionally, as a middlewares plugin) rejects publishing such versions outright",
   "license": "MIT",
   "repository": "fortmesa/verdaccio-security-filter",
@@ -27,11 +27,12 @@
     "redis-store.js",
     "osv-client.js",
     "legacy-audit.js",
+    "sensitive-paths.js",
     "webhook.js"
   ],
   "scripts": {
     "prepare": "husky",
-    "test": "node test/smoke.js && node test/smoke-webhook.js && node test/smoke-malicious-packages.js && node test/smoke-storage-backends.js && node test/smoke-legacy-audit.js && node test/smoke-large-publish.js && node test/smoke-version-matching.js",
+    "test": "node test/smoke.js && node test/smoke-webhook.js && node test/smoke-malicious-packages.js && node test/smoke-storage-backends.js && node test/smoke-legacy-audit.js && node test/smoke-large-publish.js && node test/smoke-version-matching.js && node test/smoke-sensitive-paths.js",
     "test:cli": "node test/cli-real.js"
   },
   "lint-staged": {
@@ -44,6 +45,7 @@
     "body-parser": "^1.20.5",
     "minimatch": "^10.2.5",
     "semver": "^7.6.0",
+    "tar": "^7.5.20",
     "yauzl": "^3.1.0"
   },
   "peerDependencies": {

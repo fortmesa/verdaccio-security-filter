@@ -5,6 +5,22 @@ quick-start config. This page covers everything else in depth.
 
 ## Full config
 
+`filters:` and `middlewares:` are two independently-loaded plugin instances (see
+"Publish-time gate" below) -- which section a given key actually has to go under
+depends on whether it's read from the _canonical_ config (shared between both
+instances) or each instance's own _local_ config (only seen by whichever
+instance is declared under that section):
+
+- **Canonical, shared -- go under `filters:`, read by both instances
+  regardless:** `block`, `allow`, `webhook`, `osv.*`, `scriptHeuristics.*`,
+  `sensitivePaths.*`.
+- **Local, per-instance -- only take effect on the instance actually declared
+  under that section:** `packageAge.*` and `osv.blockStrategy` (only meaningful
+  under `filters:` -- only `filter_metadata()`, the read path, consults them);
+  `blockPublishWithNewScripts`/`blockPublishMatches` (only meaningful under
+  `middlewares:` -- only the publish-time gate consults them). Putting one of
+  these under the _other_ section is a silent no-op, not an error.
+
 ```yaml
 filters:
   '@fortmesa/verdaccio-security-filter':
@@ -14,8 +30,6 @@ filters:
       thresholdDate: null # optional -- bare date ("2026-01-01") or full ISO-8601 timestamp; see "Manual block/allow lists" below
     block: [] # optional manual block list -- see below
     allow: [] # optional manual allow list -- see below
-    blockPublishWithNewScripts: false # see "Publish-time gate"
-    blockPublishMatches: false # see "Publish-time gate"
     # Single, static webhook target fired for every loud security event --
     # see "Webhooks" below. Omit entirely to disable.
     webhook:
@@ -52,6 +66,25 @@ filters:
         cwe: []
         cvss3Min: null
         cvss4Min: null
+    # Structural obfuscation heuristics -- see "Structural obfuscation
+    # heuristics" below
+    scriptHeuristics:
+      enabled: false
+      blockShellPipe: false
+    # Sensitive-path touch -- see "Sensitive path touch" below
+    sensitivePaths:
+      enabled: false
+      block: false
+      paths: [] # optional -- overrides the built-in default list entirely
+
+middlewares:
+  '@fortmesa/verdaccio-security-filter':
+    blockPublishWithNewScripts: false # see "Publish-time gate"
+    blockPublishMatches: false # see "Publish-time gate"
+    # block/allow/webhook/osv/scriptHeuristics/sensitivePaths above are all
+    # read from the canonical filters: section regardless of whether this
+    # plugin is also listed under middlewares: -- no need to duplicate them
+    # here, and doing so has no effect (see the canonical-vs-local split above).
 ```
 
 There's no separate skip-list for the age check -- a package that needs to
@@ -555,6 +588,94 @@ stored. This is robust to either shape npm sends (just the new version, or the
 full merged set) and naturally leaves `npm deprecate`/`npm star` requests
 untouched, since neither introduces a version key that isn't already stored.
 
+## Structural obfuscation heuristics
+
+Beyond the exact-match checks above (OSV blocklist, manual `block:` rules,
+script introduction/content-change), this looks for _structural_ signs that a
+`preinstall`/`install`/`postinstall` script's own command text is obfuscated or
+exfiltrating something -- deliberately not literal known-bad string/IOC
+matching, since real malicious payloads are near-universally obfuscated
+specifically to evade that:
+
+```yaml
+filters:
+  '@fortmesa/verdaccio-security-filter':
+    scriptHeuristics:
+      enabled: false # opt-in, matches every other feature area
+      blockShellPipe: false # opt-in second gate -- see below
+```
+
+Four patterns are checked, ranked by how much a hit alone actually means:
+
+- **shell-pipe** -- piping a fetched payload straight into a shell interpreter
+  (`curl ... | sh`, `wget ... | bash`, etc). High confidence, low false-positive
+  rate: legitimate installers don't need to do this even when they do fetch
+  something (they'd write a file and let node execute it, not exec a downloaded
+  script blind).
+- **eval** -- `eval(...)`/`new Function(...)` in the command string.
+- **base64-blob** -- a long contiguous base64-alphabet run, the shape of an
+  inlined obfuscated/encoded payload.
+- **network-call** -- `curl`/`wget`/a raw IP-shaped URL. Real, common,
+  _legitimate_ lifecycle scripts do this too (node-gyp, sharp, esbuild all fetch
+  prebuilt binaries this way) -- this alone means nothing; a bare network call
+  with no other signal alongside it is never flagged at all. It only adds
+  confidence alongside another signal.
+
+`enabled` alone only alerts: it logs (and, at publish time, also fires the
+webhook) but never blocks or hides anything. `blockShellPipe` is a second,
+separate opt-in specifically for the one pattern (`shell-pipe`) confident enough
+to justify actually blocking on -- every other pattern always just alerts, never
+blocks, no matter how `blockShellPipe` is set.
+
+Applies on both the read path (`filter_metadata()`, log only, no webhook -- this
+runs on every metadata read of a gated package, potentially far more often than
+it's actually published) and the publish path (`_checkPublish()`, log +
+webhook). Unlike `sensitivePaths` above, the publish-time half of this check is
+currently only reached when `blockPublishWithNewScripts` is _also_ `true` (an
+artifact of where this check sits in `_checkPublish()`'s gate ordering) --
+`scriptHeuristics.enabled` alone is enough for the read-time check, but not yet
+sufficient on its own to activate the publish-time half.
+
+## Sensitive path touch
+
+A `preinstall`/`install`/`postinstall` script has no legitimate reason to read
+from or write to a credential store, cloud config, shell history, or editor/
+agent auto-run config directory -- doing so is a real supply-chain technique
+(planting a `.vscode/tasks.json` or `.claude/settings.json` hook that fires
+later when a developer opens the project is just as viable an attack as stealing
+`~/.ssh` or `~/.aws` directly). This check flags an install script that touches
+one of those paths either **directly**, in its own command text, or
+**indirectly**, by invoking a bundled local script file that itself touches one
+-- the indirect check resolves that file's content out of the published
+tarball's own attachment, so it only ever runs at publish time.
+
+```yaml
+filters:
+  '@fortmesa/verdaccio-security-filter':
+    sensitivePaths:
+      enabled: false # opt-in, matches every other feature area
+      block: false # opt-in second gate -- see below
+      paths: [] # optional -- overrides sensitive-paths.js's built-in default list entirely
+```
+
+The built-in default `paths` list (see `sensitive-paths.js`'s
+`DEFAULT_SENSITIVE_PATHS`) covers SSH/npm/yarn credentials, major cloud CLI
+config directories, Terraform/Docker/crypto-wallet state, shell history, and
+`.vscode`/`.claude`/`.antigravity`/`.cursor` editor/agent auto-run config.
+Setting `paths` replaces this list entirely rather than extending it.
+
+Same two-flag shape as the obfuscation heuristics above: `enabled` alone only
+alerts (log, plus a webhook at publish time); `block` also acts on a hit --
+hiding the version on read (`filter_metadata()`) and rejecting the publish
+outright (`_checkPublish()`, gated the same way `blockPublishWithNewScripts`/
+`blockPublishMatches` are -- this plugin must also be listed under
+`middlewares:` for the publish-time half to run at all).
+
+The indirect check only ever fires at publish time, since only then does this
+plugin see the tarball's own bytes (from the publish request's `_attachments`
+entry) -- `filter_metadata()`'s read-time equivalent only ever exercises the
+direct, command-text check.
+
 ## Audit / advisory endpoints
 
 Real `npm audit`/`yarn npm audit` support -- both the modern and legacy wire
@@ -730,13 +851,17 @@ ranges, stable/prerelease detection, and sorting redirect/replace candidates.
 `minimatch` -- `block:`/`allow:` pattern matching, the same convention Verdaccio
 core (and every other plugin in this family) uses for package-name matching.
 `body-parser` -- used only by the publish-time gates, to parse the request body
-ahead of Verdaccio's own parsing; unused when both `blockPublishWithNewScripts`
-and `blockPublishMatches` are left at their default `false`. `yauzl` -- streams
-the OSV bootstrap zip without holding the whole archive decompressed in memory
-at once. `ae-cvss-calculator` -- computes CVSS v3.1/v4.0 base scores for
-`osv.cve.cvss3Min`/`cvss4Min` (see "CVE (GHSA) blocking" above); a regular
-dependency, not an optional peer, since CVE data (including scores) is always
-computed at sync time whenever `osv.enabled: true`, the same as severity/CWE.
+ahead of Verdaccio's own parsing; unused when `blockPublishWithNewScripts`,
+`blockPublishMatches`, and `sensitivePaths.enabled` are all left at their
+default `false`. `yauzl` -- streams the OSV bootstrap zip without holding the
+whole archive decompressed in memory at once. `tar` -- used only by
+`sensitivePaths`' indirect check, to read specific entries back out of a
+publish's own tarball attachment (gzip auto-detected; nothing else in this
+plugin ever touches tarball bytes). `ae-cvss-calculator` -- computes CVSS
+v3.1/v4.0 base scores for `osv.cve.cvss3Min`/`cvss4Min` (see "CVE (GHSA)
+blocking" above); a regular dependency, not an optional peer, since CVE data
+(including scores) is always computed at sync time whenever `osv.enabled: true`,
+the same as severity/CWE.
 
 `@aws-sdk/client-dynamodb`, `@aws-sdk/lib-dynamodb`, and `ioredis` are
 **optional peer dependencies** (see [Storage backends](#storage-backends)
