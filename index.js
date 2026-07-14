@@ -35,6 +35,95 @@ function hasInstallScript(versionMeta) {
   return INSTALL_SCRIPTS.some(s => s in (versionMeta?.scripts ?? {}));
 }
 
+// The existing "newly introduced" check above only ever compares script
+// *presence* (a key appearing that wasn't there before) -- a compromise that
+// modifies an *existing* install script's own command string (common for a
+// package that's always legitimately shipped one, e.g. for a native build)
+// would never trip it at all, since the key was already present in both the
+// old and new version. This compares content directly: any INSTALL_SCRIPTS
+// key present in both versions, with a different command string, is exactly
+// as suspicious as a newly-added one -- same threat category, same
+// treatment. Deliberately not gated by scriptIntroductionIsRecent (see
+// filter_metadata()'s own use of that flag) -- that flag answers "when did
+// this package first start shipping scripts at all", a different, unrelated
+// question from "did this specific version change an existing script's
+// content", which is inherently about the version just published, not
+// history.
+function changedInstallScripts(previousVersionMeta, currentVersionMeta) {
+  const previousScripts = previousVersionMeta?.scripts ?? {};
+  const currentScripts = currentVersionMeta?.scripts ?? {};
+  return INSTALL_SCRIPTS.filter(
+    s =>
+      s in previousScripts &&
+      s in currentScripts &&
+      previousScripts[s] !== currentScripts[s],
+  );
+}
+
+// Structural obfuscation heuristics for lifecycle script command strings --
+// deliberately not literal known-bad string/IOC matching, since real
+// malicious payloads are near-universally obfuscated specifically to evade
+// that. Scoped to the scripts field's own command text only (not tarball
+// contents -- unpacking every tarball to scan referenced files is a much
+// bigger scope increase than this plugin takes on).
+//
+// Ranked by how much a hit alone actually means:
+// - shellPipe: piping a fetched payload straight into a shell interpreter.
+//   High confidence, low false-positive rate -- legitimate installers don't
+//   need to do this even when they do fetch something (they'd write a file
+//   and let node execute it, not exec a downloaded script blind).
+// - evalOrFunction: `eval(...)`/`new Function(...)` in the command string.
+// - longBase64Blob: a long contiguous base64-alphabet run, the shape of an
+//   inlined obfuscated/encoded payload.
+// - networkCall: curl/wget/a raw IP-shaped URL. Real, common, LEGITIMATE
+//   lifecycle scripts do this too (node-gyp, sharp, esbuild all fetch
+//   prebuilt binaries this way) -- this alone means nothing; it only adds
+//   confidence alongside another signal.
+const SHELL_PIPE_PATTERN = /\b(curl|wget)\b[^|;\n]*\|\s*(sh|bash|zsh|node)\b/i;
+const EVAL_PATTERN = /\b(eval|new\s+Function)\s*\(/;
+// Deliberately excludes "/" from the alphabet, unlike standard base64 --
+// real-world URLs (github.com/foo/bar/releases/download/...) are otherwise
+// indistinguishable from a base64 run under a naive character-class check,
+// confirmed directly: a real prebuilt-binary download URL matched this
+// exact pattern before "/" was excluded. This only loses detection of
+// standard (not URL-safe) base64 strings that happen to need a "/" byte in
+// this exact 40-char window -- a narrow miss, far better than flagging
+// ordinary URLs as "a base64 blob" and defeating the bare-network-call
+// carve-out below.
+const LONG_BASE64_PATTERN =
+  /(?:[A-Za-z0-9+]{4}){10,}(?:[A-Za-z0-9+]{2}==|[A-Za-z0-9+]{3}=)?/;
+const NETWORK_CALL_PATTERN =
+  /\b(curl|wget)\b|https?:\/\/(?:\d{1,3}\.){3}\d{1,3}\b/i;
+
+// Returns null if nothing rises above "too common in legitimate scripts to
+// mean anything alone" -- specifically, a bare network call with no other
+// signal alongside it.
+function classifySuspiciousScript(command) {
+  if (typeof command !== 'string' || command.length === 0) return null;
+  const hits = [];
+  if (SHELL_PIPE_PATTERN.test(command)) hits.push('shell-pipe');
+  if (EVAL_PATTERN.test(command)) hits.push('eval');
+  if (LONG_BASE64_PATTERN.test(command)) hits.push('base64-blob');
+  if (NETWORK_CALL_PATTERN.test(command)) hits.push('network-call');
+  if (hits.length === 0) return null;
+  if (hits.length === 1 && hits[0] === 'network-call') return null;
+  return {hits, highConfidence: hits.includes('shell-pipe')};
+}
+
+// Checks every INSTALL_SCRIPTS command in a version's own scripts field --
+// returns the first classified hit found, alongside which script key it
+// came from, or null. One hit is enough to act on; this isn't trying to
+// enumerate every offending script in a version, just to catch one.
+function findSuspiciousScript(versionMeta) {
+  const scripts = versionMeta?.scripts ?? {};
+  for (const key of INSTALL_SCRIPTS) {
+    if (!(key in scripts)) continue;
+    const classified = classifySuspiciousScript(scripts[key]);
+    if (classified) return {key, command: scripts[key], ...classified};
+  }
+  return null;
+}
+
 // True if at least one already-stored version of the package has no install
 // script -- i.e. there's an established "clean" baseline a new script could
 // be violating. A package that has *always* shipped install scripts (e.g. a
@@ -202,6 +291,18 @@ class SecurityFilter {
       config.blockPublishWithNewScripts ?? false;
     this.blockPublishMatches = config.blockPublishMatches ?? false;
 
+    // Structural obfuscation heuristics -- see classifySuspiciousScript()'s
+    // own comment for the full rationale and confidence ranking. Opt-in,
+    // matching every other feature area in this plugin (osv.enabled,
+    // blockPublishWithNewScripts, ...) rather than auto-enabling new
+    // pattern-matching behavior. Read-only (alert via webhook, never
+    // block/reject) by default even when enabled -- blockShellPipe is a
+    // second, separate opt-in specifically for the one pattern confident
+    // enough to justify actually blocking on.
+    const scriptHeuristics = sharedConfig.scriptHeuristics ?? {};
+    this.scriptHeuristicsEnabled = scriptHeuristics.enabled ?? false;
+    this.blockShellPipe = scriptHeuristics.blockShellPipe ?? false;
+
     // Matches Verdaccio's own global JSON body limit (api/endpoint/index.js
     // uses the same `max_body_size || '10mb'` fallback) so this gate never
     // diverges from what Verdaccio itself would accept as a request size.
@@ -254,103 +355,167 @@ class SecurityFilter {
     const blocked = new Set();
     const replaceRequested = new Set();
     let seenCleanVersion = false;
+    // Tracks the immediately-preceding version's own metadata (in the same
+    // oldest-first order as everything else here), regardless of whether
+    // that version itself ended up blocked -- content-diffing needs the
+    // actual publish history, not just the versions that passed every other
+    // check. Updated in the finally block below so every continue path
+    // still advances it.
+    let previousVersionMeta = null;
 
     for (const ver of sortedByAge) {
-      const publishedAt = time[ver] ? new Date(time[ver]).getTime() : null;
+      try {
+        const publishedAt = time[ver] ? new Date(time[ver]).getTime() : null;
 
-      // 1. Allow-list -- bypasses everything below, including the OSV check.
-      if (
-        findMatchingRules(this.allowRules, packageInfo.name, ver).length > 0
-      ) {
-        if (!hasInstallScript(versions[ver])) seenCleanVersion = true;
-        continue;
-      }
+        // 1. Allow-list -- bypasses everything below, including the OSV check.
+        if (
+          findMatchingRules(this.allowRules, packageInfo.name, ver).length > 0
+        ) {
+          if (!hasInstallScript(versions[ver])) seenCleanVersion = true;
+          continue;
+        }
 
-      // 2. OSV synced malicious-package/CVE blocklist.
-      const osvHit = this.maliciousPackageStore?.check(packageInfo.name, ver);
-      if (osvHit) {
-        blocked.add(ver);
-        if (this.osvBlockStrategy === 'replace') replaceRequested.add(ver);
-        if (osvHit.type === 'cve') {
+        // 2. OSV synced malicious-package/CVE blocklist.
+        const osvHit = this.maliciousPackageStore?.check(packageInfo.name, ver);
+        if (osvHit) {
+          blocked.add(ver);
+          if (this.osvBlockStrategy === 'replace') replaceRequested.add(ver);
+          if (osvHit.type === 'cve') {
+            this.logger.warn(
+              {
+                pkg: packageInfo.name,
+                ver,
+                cveId: osvHit.cveId,
+                severity: osvHit.severity,
+                cweIds: osvHit.cweIds,
+              },
+              'security-filter: blocked -- version matches known vulnerability @{cveId} [@{severity}, @{cweIds}] (OSV)',
+            );
+          } else {
+            this.logger.warn(
+              {pkg: packageInfo.name, ver, malIds: osvHit.malIds},
+              'security-filter: blocked -- version matches known-malicious-package advisory [@{malIds}] (OSV)',
+            );
+          }
+          continue;
+        }
+
+        // 3. Manual block: list.
+        const matchedBlockRules = findMatchingRules(
+          this.blockRules,
+          packageInfo.name,
+          ver,
+        );
+        if (matchedBlockRules.length > 0) {
+          blocked.add(ver);
+          const strategy = matchedBlockRules.every(
+            r => r.strategy === 'replace',
+          )
+            ? 'replace'
+            : 'remove';
+          if (strategy === 'replace') replaceRequested.add(ver);
           this.logger.warn(
             {
               pkg: packageInfo.name,
               ver,
-              cveId: osvHit.cveId,
-              severity: osvHit.severity,
-              cweIds: osvHit.cweIds,
+              rule: matchedBlockRules.map(describeRule).join(', '),
             },
-            'security-filter: blocked -- version matches known vulnerability @{cveId} [@{severity}, @{cweIds}] (OSV)',
+            `security-filter: blocked -- matched manual block list${strategy === 'replace' ? ' (replace)' : ''}`,
           );
-        } else {
-          this.logger.warn(
-            {pkg: packageInfo.name, ver, malIds: osvHit.malIds},
-            'security-filter: blocked -- version matches known-malicious-package advisory [@{malIds}] (OSV)',
-          );
+          continue;
         }
-        continue;
-      }
 
-      // 3. Manual block: list.
-      const matchedBlockRules = findMatchingRules(
-        this.blockRules,
-        packageInfo.name,
-        ver,
-      );
-      if (matchedBlockRules.length > 0) {
-        blocked.add(ver);
-        const strategy = matchedBlockRules.every(r => r.strategy === 'replace')
-          ? 'replace'
-          : 'remove';
-        if (strategy === 'replace') replaceRequested.add(ver);
-        this.logger.warn(
-          {
-            pkg: packageInfo.name,
-            ver,
-            rule: matchedBlockRules.map(describeRule).join(', '),
-          },
-          `security-filter: blocked -- matched manual block list${strategy === 'replace' ? ' (replace)' : ''}`,
+        // 4. Age / date, combined.
+        if (publishedAt === null) {
+          blocked.add(ver);
+          this.logger.warn(
+            {pkg: packageInfo.name, ver},
+            'security-filter: blocked -- publish date unknown',
+          );
+          continue;
+        }
+        if (publishedAt >= effectiveCutoffMs) {
+          blocked.add(ver);
+          this.logger.warn(
+            {pkg: packageInfo.name, ver, cutoff: cutoffKind},
+            'security-filter: blocked -- version too new',
+          );
+          continue;
+        }
+
+        // 5. Install-script introduction -- existing, unchanged.
+        const installScriptKeys = INSTALL_SCRIPTS.filter(
+          s => s in (versions[ver].scripts ?? {}),
         );
-        continue;
-      }
+        const isScripted = installScriptKeys.length > 0;
 
-      // 4. Age / date, combined.
-      if (publishedAt === null) {
-        blocked.add(ver);
-        this.logger.warn(
-          {pkg: packageInfo.name, ver},
-          'security-filter: blocked -- publish date unknown',
+        // Block if this package recently introduced install scripts after previously having none.
+        // scriptIntroductionIsRecent ensures packages like esbuild (scripts added years ago) are never blocked.
+        if (isScripted && seenCleanVersion && scriptIntroductionIsRecent) {
+          blocked.add(ver);
+          this.logger.error(
+            {pkg: packageInfo.name, ver, scripts: installScriptKeys},
+            'security-filter: blocked -- install scripts newly introduced in this version',
+          );
+          continue;
+        }
+
+        // 5b. Install-script content changed -- see changedInstallScripts()'s
+        // own comment for why this is a distinct check from the
+        // presence-only one above.
+        const changedScripts = changedInstallScripts(
+          previousVersionMeta,
+          versions[ver],
         );
-        continue;
-      }
-      if (publishedAt >= effectiveCutoffMs) {
-        blocked.add(ver);
-        this.logger.warn(
-          {pkg: packageInfo.name, ver, cutoff: cutoffKind},
-          'security-filter: blocked -- version too new',
-        );
-        continue;
-      }
+        if (changedScripts.length > 0) {
+          blocked.add(ver);
+          this.logger.error(
+            {pkg: packageInfo.name, ver, scripts: changedScripts},
+            'security-filter: blocked -- install script content changed from the previous version',
+          );
+          continue;
+        }
 
-      // 5. Install-script introduction -- existing, unchanged.
-      const installScriptKeys = INSTALL_SCRIPTS.filter(
-        s => s in (versions[ver].scripts ?? {}),
-      );
-      const isScripted = installScriptKeys.length > 0;
+        // 5c. Structural obfuscation heuristics -- see
+        // classifySuspiciousScript()'s own comment for the confidence
+        // ranking. Deliberately no webhook here, unlike the publish-time
+        // gate's own version of this check below -- filter_metadata() runs on
+        // every metadata read of a gated package, potentially far more often
+        // than it's actually published, and every other read-time check in
+        // this method already only logs, never alerts, for the same reason.
+        if (this.scriptHeuristicsEnabled) {
+          const suspicious = findSuspiciousScript(versions[ver]);
+          if (suspicious) {
+            if (suspicious.highConfidence && this.blockShellPipe) {
+              blocked.add(ver);
+              this.logger.error(
+                {
+                  pkg: packageInfo.name,
+                  ver,
+                  script: suspicious.key,
+                  hits: suspicious.hits,
+                },
+                'security-filter: blocked -- install script matches a high-confidence obfuscation/exfiltration pattern (@{hits})',
+              );
+              continue;
+            }
+            this.logger.warn(
+              {
+                pkg: packageInfo.name,
+                ver,
+                script: suspicious.key,
+                hits: suspicious.hits,
+              },
+              'security-filter: install script matches a suspicious pattern (@{hits}), not blocked',
+            );
+          }
+        }
 
-      // Block if this package recently introduced install scripts after previously having none.
-      // scriptIntroductionIsRecent ensures packages like esbuild (scripts added years ago) are never blocked.
-      if (isScripted && seenCleanVersion && scriptIntroductionIsRecent) {
-        blocked.add(ver);
-        this.logger.error(
-          {pkg: packageInfo.name, ver, scripts: installScriptKeys},
-          'security-filter: blocked -- install scripts newly introduced in this version',
-        );
-        continue;
-      }
-
-      if (!isScripted) {
-        seenCleanVersion = true;
+        if (!isScripted) {
+          seenCleanVersion = true;
+        }
+      } finally {
+        previousVersionMeta = versions[ver];
       }
     }
 
@@ -536,6 +701,56 @@ class SecurityFilter {
 
     if (!this.blockPublishWithNewScripts && !this.blockPublishMatches) return;
 
+    // Workaround for verdaccio/verdaccio#1912 (reported 2020, unfixed in
+    // the currently-published @verdaccio/middleware -- see
+    // verdaccio-oidc-auth's own identical comment on its own copy of this
+    // same fix for the full analysis). @verdaccio/middleware's own
+    // access-log middleware attaches req.on('data', ...) unconditionally,
+    // on every request, purely to count bytes -- switching the request
+    // stream into Node's flowing mode immediately. Any async middleware
+    // ahead of this plugin's own body-parser below (an authentication
+    // plugin doing a real network-bound token check is the common case,
+    // but this deployment cannot assume one is even installed, let alone
+    // which one) opens a window where the stream can fully drain via that
+    // listener alone before any body-parser -- this plugin's own,
+    // Verdaccio core's, or another plugin's -- ever gets to attach its own.
+    // This must not depend on any specific other plugin (e.g.
+    // verdaccio-oidc-auth) being installed at all -- these plugins are
+    // published and used independently, in any combination a deployment
+    // chooses -- so this protects itself the same way, using body-parser's
+    // own pre-existing req.body/req._body contract rather than a
+    // plugin-specific signal: if some earlier middleware already populated
+    // req.body (this plugin's own JSON parsing below already respects that
+    // via body-parser's own req._body check), skip; otherwise read the
+    // body synchronously as the very first thing here, before this
+    // middleware's own path/segment parsing even runs.
+    app.use((req, res, next) => {
+      if (req._body) return next();
+      const contentEncoding = (req.headers['content-encoding'] || '')
+        .trim()
+        .toLowerCase();
+      if (
+        req.method !== 'PUT' ||
+        !/json/i.test(req.headers['content-type'] || '') ||
+        (contentEncoding !== '' && contentEncoding !== 'identity')
+      ) {
+        return next();
+      }
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        try {
+          req.body = raw.length > 0 ? JSON.parse(raw.toString('utf8')) : {};
+        } catch (err) {
+          return next(err);
+        }
+        req._body = true;
+        next();
+      });
+      req.on('error', err => next(err));
+    });
+
     app.use((req, res, next) => {
       if (req.method !== 'PUT') return next();
 
@@ -562,7 +777,26 @@ class SecurityFilter {
       // later parse attempt becomes a no-op instead of double-reading an
       // already-drained request stream.
       this._parseJsonBody(req, res, err => {
-        if (err) return next(err); // propagate straight to Verdaccio's own error handling
+        if (err) {
+          // raw-body's own error carries expected/received/type properties
+          // that never otherwise reach any log line (Verdaccio's own
+          // request logger only captures err.message) -- surfacing them
+          // here is the only way to see the byte-count discrepancy behind
+          // a "request size did not match content length" failure, should
+          // one ever happen again despite the buffering middleware above.
+          this.logger.error(
+            {
+              pkg: packageName,
+              errType: err.type,
+              errMessage: err.message,
+              expected: err.expected,
+              received: err.received,
+              length: err.length,
+            },
+            'security-filter: publish body parse failed (@{errType}: @{errMessage}, expected=@{expected} received=@{received})',
+          );
+          return next(err); // propagate straight to Verdaccio's own error handling
+        }
         if (!req.body?.versions || typeof req.body.versions !== 'object')
           return next();
         this._checkPublish(req, res, next, storage, packageName);
@@ -695,51 +929,218 @@ class SecurityFilter {
           }
         }
 
+        if (!this.blockPublishWithNewScripts) return next();
+
         // Existing install-script-introduction heuristic, unchanged, but
         // also allow-list-aware for consistency with the read path's full
         // precedence stack.
-        if (!this.blockPublishWithNewScripts) return next();
-        if (!hasCleanBaseline(existingVersions)) return next();
-        const offendingVersion = newVersionKeys.find(
-          v =>
-            hasInstallScript(incomingVersions[v]) &&
-            findMatchingRules(this.allowRules, packageName, v).length === 0,
-        );
-        if (!offendingVersion) return next();
+        if (hasCleanBaseline(existingVersions)) {
+          const offendingVersion = newVersionKeys.find(
+            v =>
+              hasInstallScript(incomingVersions[v]) &&
+              findMatchingRules(this.allowRules, packageName, v).length === 0,
+          );
+          if (offendingVersion) {
+            const scripts = INSTALL_SCRIPTS.filter(
+              s => s in (incomingVersions[offendingVersion].scripts ?? {}),
+            );
+            const commands = Object.fromEntries(
+              scripts.map(s => [
+                s,
+                incomingVersions[offendingVersion].scripts[s],
+              ]),
+            );
 
-        const scripts = INSTALL_SCRIPTS.filter(
-          s => s in (incomingVersions[offendingVersion].scripts ?? {}),
-        );
-        const commands = Object.fromEntries(
-          scripts.map(s => [s, incomingVersions[offendingVersion].scripts[s]]),
-        );
+            this.logger.fatal(
+              {
+                pkg: packageName,
+                ver: offendingVersion,
+                user,
+                scripts,
+                commands,
+              },
+              'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} introduces install script(s) ' +
+                '[@{scripts}] not present in any previously published version -- rejected as a likely ' +
+                'supply-chain compromise pattern',
+            );
 
-        this.logger.fatal(
-          {pkg: packageName, ver: offendingVersion, user, scripts, commands},
-          'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} introduces install script(s) ' +
-            '[@{scripts}] not present in any previously published version -- rejected as a likely ' +
-            'supply-chain compromise pattern',
-        );
+            const scriptReason =
+              `SECURITY BLOCK: publish of ${packageName}@${offendingVersion} rejected -- it introduces install ` +
+              `script(s) [${scripts.join(', ')}] that no previously published version of this package had. This ` +
+              'is blocked as a likely supply-chain compromise pattern. Contact a registry administrator if this ' +
+              'script is intentional.';
+            sendWebhook(
+              this.webhookConfig,
+              {
+                event: 'publish_blocked_script',
+                pkg: packageName,
+                ver: offendingVersion,
+                user,
+                scripts: scripts.join(', '),
+                reason: scriptReason,
+              },
+              this.logger,
+            );
 
-        const scriptReason =
-          `SECURITY BLOCK: publish of ${packageName}@${offendingVersion} rejected -- it introduces install ` +
-          `script(s) [${scripts.join(', ')}] that no previously published version of this package had. This ` +
-          'is blocked as a likely supply-chain compromise pattern. Contact a registry administrator if this ' +
-          'script is intentional.';
-        sendWebhook(
-          this.webhookConfig,
-          {
-            event: 'publish_blocked_script',
-            pkg: packageName,
-            ver: offendingVersion,
-            user,
-            scripts: scripts.join(', '),
-            reason: scriptReason,
-          },
-          this.logger,
-        );
+            return res
+              .status(403)
+              .json({error: 'forbidden', reason: scriptReason});
+          }
+        }
 
-        res.status(403).json({error: 'forbidden', reason: scriptReason});
+        // Install-script content changed -- independent of hasCleanBaseline
+        // above (that precondition only applies to the presence-only check;
+        // see changedInstallScripts()'s own comment for why a package that's
+        // always shipped a script is still worth checking here). Compares
+        // against dist-tags.latest -- what a normal install would actually
+        // get today -- not full publish history, keeping this a simple,
+        // single comparison rather than its own historical scan.
+        const latestExistingVersion = existing?.['dist-tags']?.latest;
+        const previousVersionMeta = latestExistingVersion
+          ? existingVersions[latestExistingVersion]
+          : null;
+        if (previousVersionMeta) {
+          const offendingVersion = newVersionKeys.find(
+            v =>
+              changedInstallScripts(previousVersionMeta, incomingVersions[v])
+                .length > 0 &&
+              findMatchingRules(this.allowRules, packageName, v).length === 0,
+          );
+          if (offendingVersion) {
+            const scripts = changedInstallScripts(
+              previousVersionMeta,
+              incomingVersions[offendingVersion],
+            );
+            const commands = Object.fromEntries(
+              scripts.map(s => [
+                s,
+                incomingVersions[offendingVersion].scripts[s],
+              ]),
+            );
+
+            this.logger.fatal(
+              {
+                pkg: packageName,
+                ver: offendingVersion,
+                user,
+                scripts,
+                commands,
+              },
+              'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} changed the content of ' +
+                'existing install script(s) [@{scripts}] from the previously published version -- rejected ' +
+                'as a likely supply-chain compromise pattern',
+            );
+
+            const scriptReason =
+              `SECURITY BLOCK: publish of ${packageName}@${offendingVersion} rejected -- it changes the ` +
+              `content of install script(s) [${scripts.join(', ')}] from ${packageName}@${latestExistingVersion}. ` +
+              'This is blocked as a likely supply-chain compromise pattern. Contact a registry administrator ' +
+              'if this change is intentional.';
+            sendWebhook(
+              this.webhookConfig,
+              {
+                event: 'publish_blocked_script_changed',
+                pkg: packageName,
+                ver: offendingVersion,
+                user,
+                scripts: scripts.join(', '),
+                reason: scriptReason,
+              },
+              this.logger,
+            );
+
+            return res
+              .status(403)
+              .json({error: 'forbidden', reason: scriptReason});
+          }
+        }
+
+        // Structural obfuscation heuristics -- see
+        // classifySuspiciousScript()'s own comment for the confidence
+        // ranking. Unlike the two checks above, a hit here is never a hard
+        // reject unless it's the one high-confidence pattern AND
+        // blockShellPipe is separately opted into -- everything else alerts
+        // (webhook) but still lets the publish through, since these are
+        // heuristics with a real false-positive rate, not the exact-match
+        // certainty the OSV/manual-block/content-diff checks have.
+        if (this.scriptHeuristicsEnabled) {
+          const blockableVersion = newVersionKeys.find(v => {
+            if (findMatchingRules(this.allowRules, packageName, v).length > 0)
+              return false;
+            const suspicious = findSuspiciousScript(incomingVersions[v]);
+            return suspicious?.highConfidence && this.blockShellPipe;
+          });
+          if (blockableVersion) {
+            const suspicious = findSuspiciousScript(
+              incomingVersions[blockableVersion],
+            );
+            this.logger.fatal(
+              {
+                pkg: packageName,
+                ver: blockableVersion,
+                user,
+                script: suspicious.key,
+                hits: suspicious.hits,
+              },
+              'security-filter: !!! BLOCKED PUBLISH !!! @{pkg}@@{ver} by @{user} install script matches a ' +
+                'high-confidence obfuscation/exfiltration pattern (@{hits}) -- rejected',
+            );
+            const patternReason =
+              `SECURITY BLOCK: publish of ${packageName}@${blockableVersion} rejected -- its ` +
+              `${suspicious.key} script matches a high-confidence obfuscation/exfiltration pattern ` +
+              `(${suspicious.hits.join(', ')}). Contact a registry administrator if this is a false positive.`;
+            sendWebhook(
+              this.webhookConfig,
+              {
+                event: 'publish_blocked_suspicious_script',
+                pkg: packageName,
+                ver: blockableVersion,
+                user,
+                hits: suspicious.hits.join(', '),
+                reason: patternReason,
+              },
+              this.logger,
+            );
+            return res
+              .status(403)
+              .json({error: 'forbidden', reason: patternReason});
+          }
+
+          for (const ver of newVersionKeys) {
+            if (findMatchingRules(this.allowRules, packageName, ver).length > 0)
+              continue;
+            const suspicious = findSuspiciousScript(incomingVersions[ver]);
+            if (!suspicious) continue;
+
+            const alertReason =
+              `${packageName}@${ver}'s ${suspicious.key} script matches a suspicious pattern ` +
+              `(${suspicious.hits.join(', ')}) -- not blocked, review recommended.`;
+            this.logger.warn(
+              {
+                pkg: packageName,
+                ver,
+                user,
+                script: suspicious.key,
+                hits: suspicious.hits,
+              },
+              'security-filter: publish install script matches a suspicious pattern (@{hits}), not blocked',
+            );
+            sendWebhook(
+              this.webhookConfig,
+              {
+                event: 'publish_suspicious_script',
+                pkg: packageName,
+                ver,
+                user,
+                hits: suspicious.hits.join(', '),
+                reason: alertReason,
+              },
+              this.logger,
+            );
+          }
+        }
+
+        next();
       },
     });
   }

