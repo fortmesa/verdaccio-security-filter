@@ -196,27 +196,7 @@ jobs:
           yarn config set 'npmScopes.fortmesa.npmAlwaysAuth' true
           yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
 
-      # npm rejects republishing a version, so a re-run of this job after a
-      # publish that landed must skip instead of failing. 200 means already
-      # published, 404 means publish, anything else fails the job.
-      - name: Check whether this version is already published
-        id: version-check
-        env:
-          NPM_TOKEN: ${{ steps.oidc.outputs.token }}
-        run: |
-          set -eu
-          VERSION=$(node -p "require('./package.json').version")
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer $NPM_TOKEN" \
-            "https://npmjs.dev.fort.blue/@fortmesa%2fverdaccio-security-filter/$VERSION")
-          case "$STATUS" in
-            200) echo "should-publish=false" >> "$GITHUB_OUTPUT"; echo "$VERSION is already published -- skipping" ;;
-            404) echo "should-publish=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "unexpected HTTP $STATUS from npmjs.dev.fort.blue for $VERSION" >&2; exit 1 ;;
-          esac
-
       - name: Publish to npmjs.dev.fort.blue
-        if: steps.version-check.outputs.should-publish == 'true'
         run: yarn npm publish --access public --provenance
 
   publish-npmjs:
@@ -254,24 +234,7 @@ jobs:
           key: node-modules-${{ github.sha }}
           fail-on-cache-miss: true
 
-      # A staged version stays off the registry until it's approved, so this
-      # still answers 404 for one; approve or reject a pending stage on
-      # npmjs.com before re-running this job.
-      - name: Check whether this version is already on npmjs.org
-        id: version-check
-        run: |
-          set -eu
-          VERSION=$(node -p "require('./package.json').version")
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-            "https://registry.npmjs.org/@fortmesa%2fverdaccio-security-filter/$VERSION")
-          case "$STATUS" in
-            200) echo "should-publish=false" >> "$GITHUB_OUTPUT"; echo "$VERSION is already on npmjs.org -- skipping" ;;
-            404) echo "should-publish=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "unexpected HTTP $STATUS from registry.npmjs.org for $VERSION" >&2; exit 1 ;;
-          esac
-
       - name: Stage on npmjs.org for approval
-        if: steps.version-check.outputs.should-publish == 'true'
         run: yarn npm publish --access public --provenance --staged
 
   release:
