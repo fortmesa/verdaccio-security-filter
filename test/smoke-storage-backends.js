@@ -345,6 +345,124 @@ async function main() {
     assert.equal(client.quitCalled(), true);
   });
 
+  // A minimal RESP2 server -- just the commands redis-store.js sends, plus
+  // whatever ioredis asks on connect -- so the store runs through the real
+  // ioredis client, not a stand-in for it.
+  async function startRespServer() {
+    const net = require('node:net');
+    const data = new Map();
+    const bulk = value =>
+      value === null || value === undefined
+        ? '$-1\r\n'
+        : `$${Buffer.byteLength(value)}\r\n${value}\r\n`;
+    const array = items => `*${items.length}\r\n${items.join('')}`;
+    function handle(args) {
+      const [command, ...rest] = args;
+      switch (command.toUpperCase()) {
+        case 'GET':
+          return bulk(data.get(rest[0]) ?? null);
+        case 'SET':
+          data.set(rest[0], rest[1]);
+          return '+OK\r\n';
+        case 'DEL':
+          return `:${rest.filter(k => data.delete(k)).length}\r\n`;
+        case 'MGET':
+          return array(rest.map(k => bulk(data.get(k) ?? null)));
+        case 'SCAN': {
+          const match =
+            rest[rest.findIndex(a => a.toUpperCase() === 'MATCH') + 1] ?? '*';
+          const prefix = match.endsWith('*') ? match.slice(0, -1) : match;
+          const keys = [...data.keys()].filter(k => k.startsWith(prefix));
+          return array([bulk('0'), array(keys.map(bulk))]);
+        }
+        case 'INFO':
+          return bulk('# Server\r\nredis_version:7.2.0\r\nloading:0\r\n');
+        case 'QUIT':
+          return '+OK\r\n';
+        default:
+          return '+OK\r\n';
+      }
+    }
+    const server = net.createServer(socket => {
+      let buffer = Buffer.alloc(0);
+      socket.on('data', chunk => {
+        buffer = Buffer.concat([buffer, chunk]);
+        for (;;) {
+          const text = buffer.toString('latin1');
+          if (!text.startsWith('*')) return;
+          let pos = text.indexOf('\r\n');
+          if (pos === -1) return;
+          const count = Number(text.slice(1, pos));
+          let cursor = pos + 2;
+          const args = [];
+          for (let i = 0; i < count; i++) {
+            const end = text.indexOf('\r\n', cursor);
+            if (end === -1) return;
+            const len = Number(text.slice(cursor + 1, end));
+            if (text.length < end + 2 + len + 2) return;
+            args.push(buffer.subarray(end + 2, end + 2 + len).toString('utf8'));
+            cursor = end + 2 + len + 2;
+          }
+          buffer = buffer.subarray(cursor);
+          socket.write(handle(args));
+          if (args[0].toUpperCase() === 'QUIT') socket.end();
+        }
+      });
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    return {server, data, url: `redis://127.0.0.1:${server.address().port}`};
+  }
+
+  await check(
+    'redis: the store round-trips through the real ioredis client',
+    async () => {
+      const resp = await startRespServer();
+      const store = createRedisStore({url: resp.url, keyPrefix: 'osv:'}, {});
+      try {
+        const failed = await store.putItems([
+          {pk: 'left-pad', mals: [{id: 'MAL-1', vulnerableVersions: '*'}]},
+          {pk: 'right-pad', cves: []},
+        ]);
+        assert.deepEqual(failed, []);
+        await store.putItem({pk: '__sync_state__', bootstrapCompletedAt: 'x'});
+        resp.data.set('unrelated', 'not json at all');
+        resp.data.set('osv:not-ours', '{"pk":"someone-else"}');
+        assert.deepEqual((await store.getItem('left-pad')).mals[0].id, 'MAL-1');
+        const all = await store.scanAll();
+        assert.deepEqual(all.map(item => item.pk).sort(), [
+          '__sync_state__',
+          'left-pad',
+          'right-pad',
+        ]);
+        await store.deleteItem('right-pad');
+        assert.equal(await store.getItem('right-pad'), undefined);
+      } finally {
+        await store.close();
+        resp.server.close();
+      }
+    },
+  );
+
+  await check(
+    "redis: a shared database's foreign keys are skipped by scanAll, not fatal to it",
+    async () => {
+      const client = makeFakeRedisClient();
+      const store = createRedisStore(
+        {url: 'redis://unused'},
+        {redisClient: client},
+      );
+      await store.putItem({pk: 'left-pad', cves: []});
+      client.table.set('session:abc', 'opaque');
+      client.table.set('config', '{"theme":"dark"}');
+      client.table.set('other-app', '{"pk":"spoofed"}');
+      const all = await store.scanAll();
+      assert.deepEqual(
+        all.map(item => item.pk),
+        ['left-pad'],
+      );
+    },
+  );
+
   console.log(`\n${passed} check(s) passed.`);
 }
 

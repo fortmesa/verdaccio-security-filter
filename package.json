@@ -1,9 +1,12 @@
 {
   "name": "@fortmesa/verdaccio-security-filter",
-  "version": "1.2.4",
+  "version": "1.3.0",
   "description": "Verdaccio filter plugin: blocks versions that are too new, published after a date threshold, match a synced OSV malicious-package blocklist, match a manual block/allow list, or newly introduce install scripts, and (optionally, as a middlewares plugin) rejects publishing such versions outright",
   "license": "MIT",
-  "repository": "fortmesa/verdaccio-security-filter",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fortmesa/verdaccio-security-filter.git"
+  },
   "homepage": "https://github.com/fortmesa/verdaccio-security-filter#readme",
   "keywords": [
     "verdaccio",
@@ -15,7 +18,10 @@
     "webhook"
   ],
   "main": "index.js",
-  "packageManager": "yarn@4.17.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "yarn@4.18.1+sha512.b2e1e7524f654f2749d32b4ebcb4622473cb5bcbc485df2007e12a154e50162a4d795526768bc5f5b8f81717bfd79deb2472813d86fb5ae2eb551fa9c872b08f",
   "publishConfig": {
     "access": "public"
   },
@@ -32,7 +38,7 @@
   ],
   "scripts": {
     "prepare": "husky",
-    "test": "node test/smoke.js && node test/smoke-webhook.js && node test/smoke-malicious-packages.js && node test/smoke-storage-backends.js && node test/smoke-legacy-audit.js && node test/smoke-large-publish.js && node test/smoke-version-matching.js && node test/smoke-sensitive-paths.js",
+    "test": "node test/smoke.js && node test/smoke-webhook.js && node test/smoke-malicious-packages.js && node test/smoke-storage-backends.js && node test/smoke-legacy-audit.js && node test/smoke-large-publish.js && node test/smoke-version-matching.js && node test/smoke-sensitive-paths.js && node test/verdaccio.js",
     "test:cli": "node test/cli-real.js"
   },
   "lint-staged": {
@@ -42,16 +48,16 @@
   },
   "dependencies": {
     "ae-cvss-calculator": "^1.0.13",
-    "body-parser": "^1.20.5",
-    "minimatch": "^10.2.5",
-    "semver": "^7.6.0",
-    "tar": "^7.5.20",
-    "yauzl": "^3.1.0"
+    "body-parser": "~1.20.5",
+    "minimatch": "^10.2.6",
+    "semver": "^7.8.5",
+    "tar": "^7.5.22",
+    "yauzl": "^3.4.0"
   },
   "peerDependencies": {
     "@aws-sdk/client-dynamodb": "^3.0.0",
     "@aws-sdk/lib-dynamodb": "^3.0.0",
-    "ioredis": "^5.4.1"
+    "ioredis": "^5.4.1 || ^6.0.0"
   },
   "peerDependenciesMeta": {
     "@aws-sdk/client-dynamodb": {
@@ -65,13 +71,12 @@
     }
   },
   "devDependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1075.0",
-    "@aws-sdk/lib-dynamodb": "^3.1075.0",
+    "@aws-sdk/client-dynamodb": "^3.1156.0",
+    "@aws-sdk/lib-dynamodb": "^3.1156.0",
     "husky": "^9.1.7",
-    "ioredis": "^5.4.1",
-    "lint-staged": "^17.0.8",
-    "prettier": "^3.3.3",
-    "verdaccio": "^6.0.0",
-    "yazl": "^3.3.1"
+    "ioredis": "^6.0.0",
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.10",
+    "verdaccio": "^6.10.7"
   }
 }

@@ -46,9 +46,20 @@ function createRedisStore(config, options) {
       cursor = nextCursor;
       if (keys.length > 0) {
         const values = await redis.mget(...keys);
-        for (const value of values) {
-          if (value) items.push(JSON.parse(value));
-        }
+        // A shared database (an empty keyPrefix above all) also holds keys
+        // that aren't this plugin's: only a JSON item whose pk matches its
+        // own key is one. Anything else is skipped rather than failing the
+        // whole scan, which would start the pod with an empty blocklist.
+        values.forEach((value, idx) => {
+          if (!value) return;
+          let item;
+          try {
+            item = JSON.parse(value);
+          } catch {
+            return;
+          }
+          if (item?.pk === keys[idx].slice(keyPrefix.length)) items.push(item);
+        });
       }
     } while (cursor !== '0');
     return items;

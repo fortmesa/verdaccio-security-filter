@@ -38,15 +38,38 @@ function makeFakeStorage() {
       if (!existing) return callback({status: 404}, null);
       callback(null, existing);
     },
+    localStorage: {
+      getPackageMetadata(name, callback) {
+        const existing = existingByName.get(name);
+        if (!existing) return callback({status: 404, code: 404}, null);
+        callback(null, existing);
+      },
+    },
   };
 }
 
+// Stands in for Verdaccio's Auth#allow_publish: every request here comes
+// from a user allowed to publish (see test/smoke.js for the refusal paths).
+const ALLOW_ALL_AUTH = {
+  allow_publish(pkg, user, callback) {
+    callback(null, true);
+  },
+};
+const PUBLISHER = {name: 'tester', groups: ['$all', '$authenticated']};
+
+// register_middlewares() registers several app.use() handlers; this
+// dispatches through all of them in order, as Express would.
 async function startServer(instance, storage) {
   const handlers = [];
-  instance.register_middlewares({use: fn => handlers.push(fn)}, null, storage);
+  instance.register_middlewares(
+    {use: fn => handlers.push(fn)},
+    ALLOW_ALL_AUTH,
+    storage,
+  );
 
   const server = http.createServer((req, res) => {
     req.path = new URL(req.url, 'http://localhost').pathname;
+    req.remote_user = PUBLISHER;
     res.status = function (code) {
       this.statusCode = code;
       return this;
@@ -114,7 +137,9 @@ function makePackageInfo(name, entries, distTags = {}) {
 // npm's own tarball convention, and returns a real gzip Buffer -- exercises
 // sensitive-paths.js's extractTarballFiles() against actual tar bytes rather
 // than a hand-faked Map.
-async function buildTarball(files) {
+// `links` (relativePath -> target) adds symbolic links; `dotPrefix` packs
+// the root as "./package/..." instead of "package/...".
+async function buildTarball(files, {links = {}, dotPrefix = false} = {}) {
   const tmpRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), 'sensitive-paths-test-'),
   );
@@ -126,9 +151,16 @@ async function buildTarball(files) {
       fs.mkdirSync(path.dirname(filePath), {recursive: true});
       fs.writeFileSync(filePath, content);
     }
+    for (const [relPath, target] of Object.entries(links)) {
+      const linkPath = path.join(pkgDir, relPath);
+      fs.mkdirSync(path.dirname(linkPath), {recursive: true});
+      fs.symlinkSync(target, linkPath);
+    }
     const chunks = [];
     await new Promise((resolve, reject) => {
-      const stream = tar.create({cwd: tmpRoot, gzip: true}, ['package']);
+      const stream = tar.create({cwd: tmpRoot, gzip: true}, [
+        dotPrefix ? './package' : 'package',
+      ]);
       stream.on('data', c => chunks.push(c));
       stream.on('end', resolve);
       stream.on('error', reject);
@@ -394,24 +426,50 @@ async function main() {
   );
 
   await check(
-    'sensitivePaths (publish): indirect check finds nothing when no matching tarball attachment is present',
+    "sensitivePaths (publish): with block, an invoked script the check can't read (no tarball attached) is rejected",
     async () => {
       const storage = makeFakeStorage();
-      const logger = makeCapturingLogger();
       const server = await startServer(
-        makeInstance({sensitivePaths: {enabled: true, block: true}}, {logger}),
+        makeInstance({sensitivePaths: {enabled: true, block: true}}),
         storage,
       );
       try {
-        // No _attachments at all -- the install command only *invokes* a
-        // local file, it never mentions a sensitive path itself, so with no
-        // tarball to resolve that file from, this can't be flagged.
-        const {status} = await put(server, '/indirect-pkg-2', {
+        // No _attachments at all: the install command only *invokes* a
+        // local file, and with no tarball there's nothing to clear it with.
+        const {status, body} = await put(server, '/indirect-pkg-2', {
+          versions: {
+            '1.0.0': withScripts({postinstall: 'node scripts/setup.js'}),
+          },
+        });
+        assert.equal(status, 403);
+        assert.match(body.reason, /could not be inspected/);
+        assert.match(body.reason, /scripts\/setup\.js/);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    "sensitivePaths (publish): without block, an invoked script the check can't read alerts but the publish succeeds",
+    async () => {
+      const logger = makeCapturingLogger();
+      const server = await startServer(
+        makeInstance({sensitivePaths: {enabled: true}}, {logger}),
+        makeFakeStorage(),
+      );
+      try {
+        const {status} = await put(server, '/indirect-pkg-3', {
           versions: {
             '1.0.0': withScripts({postinstall: 'node scripts/setup.js'}),
           },
         });
         assert.equal(status, 201);
+        assert.ok(
+          logger.calls.warn.some(([fields]) =>
+            /could not be inspected/.test(fields?.detail ?? ''),
+          ),
+        );
       } finally {
         server.close();
       }
@@ -437,6 +495,174 @@ async function main() {
           _attachments: attachmentFor('clean-pkg', '1.0.0', tarball),
         });
         assert.equal(status, 201);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'sensitivePaths (publish): the attachment is read whatever its key is named, as Verdaccio stores it',
+    async () => {
+      const server = await startServer(
+        makeInstance({sensitivePaths: {enabled: true, block: true}}),
+        makeFakeStorage(),
+      );
+      try {
+        const tarball = await buildTarball({
+          'scripts/setup.js':
+            "require('fs').readFileSync(process.env.HOME + '/.npmrc')",
+        });
+        const {status, body} = await put(server, '/renamed-pkg', {
+          versions: {
+            '1.0.0': withScripts({postinstall: 'node scripts/setup.js'}),
+          },
+          _attachments: {
+            'something-else.tgz': {data: tarball.toString('base64')},
+          },
+        });
+        assert.equal(status, 403);
+        // The tarball's own script was read: an unread one would block as
+        // "could not be inspected" instead.
+        assert.match(body.reason, /which itself references \.npmrc/);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'sensitivePaths (publish): however the command spells the path, the bundled file is found',
+    async () => {
+      const server = await startServer(
+        makeInstance({sensitivePaths: {enabled: true, block: true}}),
+        makeFakeStorage(),
+      );
+      try {
+        const tarball = await buildTarball(
+          {'scripts/setup.js': 'cat ~/.aws/credentials'},
+          {dotPrefix: true},
+        );
+        for (const command of [
+          'node ./scripts//setup.js',
+          'node scripts/../scripts/setup.js',
+          'sh ./scripts/./setup.js',
+        ]) {
+          const {status} = await put(server, '/spelled-pkg', {
+            versions: {'1.0.0': withScripts({postinstall: command})},
+            _attachments: attachmentFor('spelled-pkg', '1.0.0', tarball),
+          });
+          assert.equal(status, 403, command);
+        }
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'sensitivePaths (publish): an invoked script the tarball holds as a link is rejected under block',
+    async () => {
+      const server = await startServer(
+        makeInstance({sensitivePaths: {enabled: true, block: true}}),
+        makeFakeStorage(),
+      );
+      try {
+        const tarball = await buildTarball(
+          {'real.js': 'harmless'},
+          {links: {'scripts/setup.js': '/home/user/.ssh/id_rsa'}},
+        );
+        const {status, body} = await put(server, '/linked-pkg', {
+          versions: {
+            '1.0.0': withScripts({postinstall: 'node scripts/setup.js'}),
+          },
+          _attachments: attachmentFor('linked-pkg', '1.0.0', tarball),
+        });
+        assert.equal(status, 403);
+        assert.match(body.reason, /it is a link/);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'extractTarballFiles: refuses past its inflated-size, entry-count and per-file limits, and nested compression',
+    async () => {
+      const {extractTarballFiles} = require('../sensitive-paths.js');
+      const zlib = require('node:zlib');
+      const wanted = new Set(['scripts/setup.js']);
+      const big = await buildTarball({
+        'scripts/setup.js': 'a'.repeat(200000),
+        'filler.txt': 'b'.repeat(400000),
+      });
+      await assert.rejects(
+        extractTarballFiles(big, wanted, {
+          inflatedBytes: 100000,
+          entries: 1000,
+          fileBytes: 1e9,
+        }),
+        err =>
+          err.code === 'TARBALL_LIMIT' && /inflates past/.test(err.message),
+      );
+      await assert.rejects(
+        extractTarballFiles(big, wanted, {
+          inflatedBytes: 1e9,
+          entries: 1000,
+          fileBytes: 1000,
+        }),
+        err => err.code === 'TARBALL_LIMIT' && /larger than/.test(err.message),
+      );
+      const many = await buildTarball(
+        Object.fromEntries(
+          Array.from({length: 30}, (_, i) => [`f${i}.txt`, 'x']),
+        ),
+      );
+      await assert.rejects(
+        extractTarballFiles(many, wanted, {
+          inflatedBytes: 1e9,
+          entries: 10,
+          fileBytes: 1e9,
+        }),
+        err =>
+          err.code === 'TARBALL_LIMIT' &&
+          /more than 10 entries/.test(err.message),
+      );
+      await assert.rejects(
+        extractTarballFiles(zlib.gzipSync(big), wanted),
+        /compressed more than once/,
+      );
+      await assert.rejects(
+        extractTarballFiles(Buffer.from('not an archive at all'), wanted),
+        /neither a gzip nor a tar/,
+      );
+      const ok = await extractTarballFiles(big, wanted);
+      assert.equal(ok.files.get('scripts/setup.js').length, 200000);
+    },
+  );
+
+  await check(
+    'sensitivePaths (publish): a tarball past the inspection limits leaves the invoked script unreadable, so block rejects it',
+    async () => {
+      const zlib = require('node:zlib');
+      const server = await startServer(
+        makeInstance({sensitivePaths: {enabled: true, block: true}}),
+        makeFakeStorage(),
+      );
+      try {
+        // A gzip of a gzip: refused before anything is inflated past the
+        // outer layer.
+        const tarball = zlib.gzipSync(
+          await buildTarball({'scripts/setup.js': 'echo hi'}),
+        );
+        const {status, body} = await put(server, '/bomb-pkg', {
+          versions: {
+            '1.0.0': withScripts({postinstall: 'node scripts/setup.js'}),
+          },
+          _attachments: attachmentFor('bomb-pkg', '1.0.0', tarball),
+        });
+        assert.equal(status, 403);
+        assert.match(body.reason, /could not be inspected/);
       } finally {
         server.close();
       }

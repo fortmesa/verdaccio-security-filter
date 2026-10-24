@@ -65,8 +65,9 @@ Both fire a single, static, configurable
 npm install @fortmesa/verdaccio-security-filter
 ```
 
-Verdaccio resolves a plugin by package name against whatever `plugins:` path
-you've configured -- see Verdaccio's own docs on
+Needs Node 22.12.0 or later and Verdaccio 6; the tests run against Verdaccio
+6.7.4 and 6.10.7. Verdaccio resolves a plugin by package name against whatever
+`plugins:` path you've configured -- see Verdaccio's own docs on
 [plugin resolution](https://verdaccio.org/docs/plugin-develop) if you're
 installing into a custom global location rather than a project's `node_modules`.
 
@@ -102,17 +103,28 @@ yarn install
 yarn test
 ```
 
-Runs three hand-rolled `node:assert`-based smoke test files (no test
-framework/build step) covering the filter logic, the OSV sync subsystem, and
-each storage backend's CRUD contract.
+`yarn test` runs eight hand-rolled `node:assert` smoke files (no test framework
+or build step) covering the filter, the publish gate, the OSV sync, each storage
+backend, the audit endpoints, webhooks and the tarball check. It then runs
+`test/verdaccio.js`, which starts a real Verdaccio with the plugin loaded as
+both filter and middleware, in front of a fake uplink. `VERDACCIO_BIN` points
+that file at another Verdaccio build:
+
+```bash
+VERDACCIO_BIN=../fm-npmjs/node_modules/verdaccio/bin/verdaccio node test/verdaccio.js
+```
+
+`yarn test:cli` (`test/cli-real.js`) drives real npm 5 to 11 and yarn 1 to 4
+clients against a real Verdaccio, and takes the same `VERDACCIO_BIN`. It
+downloads those clients on its first run.
 
 ## Dependencies
 
-`semver`, `body-parser`, `minimatch`, `yauzl` -- see
-[Dependencies](docs/configuration.md#dependencies) for what each is used for.
-`@aws-sdk/client-dynamodb`, `@aws-sdk/lib-dynamodb`, and `ioredis` are optional
-peer dependencies -- only install the one matching whichever OSV storage backend
-you configure.
+`semver`, `body-parser`, `minimatch`, `tar`, `yauzl`, `ae-cvss-calculator` --
+see [Dependencies](docs/configuration.md#dependencies) for what each is used
+for. `@aws-sdk/client-dynamodb`, `@aws-sdk/lib-dynamodb`, and `ioredis` are
+optional peer dependencies -- only install the one matching whichever OSV
+storage backend you configure.
 
 ## License
 

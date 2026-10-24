@@ -72,12 +72,47 @@ function pickStorageKind(config) {
 // meant to also catch prerelease versions of an affected line, which plain
 // semver.satisfies() otherwise excludes from a range with no prerelease
 // tag of its own.
+//
+// Parsed ranges are cached: a range string is parsed once, not on every
+// check, which is most of a check's cost. The cache is bounded by clearing
+// it when full; range strings repeat heavily across the feed.
+const RANGE_CACHE_MAX = 10000;
+const rangeCache = new Map();
+
+function compiledRange(vulnerableVersions) {
+  let range = rangeCache.get(vulnerableVersions);
+  if (range === undefined) {
+    try {
+      range = new semver.Range(vulnerableVersions, {includePrerelease: true});
+    } catch {
+      range = null; // semver.satisfies() treats an invalid range as matching nothing
+    }
+    if (rangeCache.size >= RANGE_CACHE_MAX) rangeCache.clear();
+    rangeCache.set(vulnerableVersions, range);
+  }
+  return range;
+}
+
 function versionSatisfies(version, vulnerableVersions) {
   const parsed = semver.valid(version) ?? semver.valid(semver.coerce(version));
   if (!parsed) return true; // can't parse the version of an already-flagged package -- fail closed
-  return semver.satisfies(parsed, vulnerableVersions, {
-    includePrerelease: true,
-  });
+  return compiledRange(vulnerableVersions)?.test(parsed) ?? false;
+}
+
+// How many cycles in a row may fail before the sync loop raises an alarm
+// (log plus webhook): a pod whose blocklist has stopped updating, or never
+// loaded, fails open for every advisory it is missing.
+const DEFAULT_STALE_AFTER_CYCLES = 4;
+
+// One MAL advisory's hold on one package, kept per advisory so a package
+// several advisories flag keeps every one of them.
+function malEntry(record, pkg) {
+  return {
+    id: record.id,
+    vulnerableVersions: pkg.vulnerableVersions,
+    originCount: pkg.originCount,
+    sources: pkg.sources,
+  };
 }
 
 function parseNonNegativeInt(value, name) {
@@ -173,7 +208,7 @@ class MaliciousPackageStore {
   constructor(config, options) {
     this.logger = options.logger;
     this.enabled = config.enabled ?? false;
-    this._blocklist = new Map(); // packageName -> { ranges, malIds, originCount, sources, cves }
+    this._blocklist = new Map(); // packageName -> { mals: [{id, vulnerableVersions, originCount, sources}], cves }
     this._timer = null;
 
     // Fired when an incremental sync's newly-applied delta matches a
@@ -218,6 +253,17 @@ class MaliciousPackageStore {
 
     this.pollIntervalMs = (config.pollSeconds ?? 900) * 1000;
     this.pollJitterMs = (config.pollJitter ?? 90) * 1000;
+    this.staleAfterCycles = parseNonNegativeInt(
+      config.staleAfterCycles ?? DEFAULT_STALE_AFTER_CYCLES,
+      'osv.staleAfterCycles',
+    );
+    const maxDownloadMB = config.maxDownloadMB ?? 512;
+    if (!Number.isInteger(maxDownloadMB) || maxDownloadMB < 1) {
+      throw new Error(
+        `security-filter: osv.maxDownloadMB must be a positive integer, got ${JSON.stringify(maxDownloadMB)}`,
+      );
+    }
+    this.maxDownloadBytes = maxDownloadMB * 1024 * 1024;
     this.baseUrl =
       config.baseUrl ??
       'https://osv-vulnerabilities.storage.googleapis.com/npm/';
@@ -227,7 +273,14 @@ class MaliciousPackageStore {
       options.store ?? this._createStore(this.storageKind, config, options);
 
     this._bootstrapCompletedAt = null;
-    this._bootstrapAttempt = 0;
+    this._warmStarted = false;
+    this._consecutiveFailures = 0;
+    this._staleAlarmRaised = false;
+    this._lastSuccessAt = null;
+    // Bootstrap items the store refused, kept for the next cycle to retry;
+    // bootstrap isn't complete until every one is written.
+    this._pendingBootstrapItems = null;
+    this._bootstrapWatermark = null;
     this._lastSyncedModifiedId = null;
     this._csvEtag = null;
     this._csvLastModified = null;
@@ -248,12 +301,13 @@ class MaliciousPackageStore {
     // construction, so a pod may serve a few seconds of traffic before this
     // resolves (see docs/plugins/security-filter.md's accepted-gap note).
     this.ready = this._warmStart()
-      .catch(err =>
+      .catch(err => {
         this.logger.error(
           {err: err.message},
-          'security-filter: osv -- startup scan failed, starting with an empty in-memory list',
-        ),
-      )
+          'security-filter: osv -- startup scan failed, starting with an empty in-memory list and retrying it next cycle',
+        );
+        this._recordCycleResult(false);
+      })
       .finally(() => {
         if (this._autoSchedule) this._scheduleNext();
       });
@@ -333,13 +387,26 @@ class MaliciousPackageStore {
   // representing one as a synthetic npm advisory needs its own dedicated
   // real npm/yarn/pnpm compatibility testing before it's included (see
   // docs/configuration.md's "Audit / advisory endpoints" section).
-  getCveAdvisories(name, versions) {
+  //
+  // `budget` ({remaining}), when given, is shared across one request's calls
+  // and charged one per version-against-advisory check; once spent this
+  // throws ADVISORY_BUDGET, so a request can't buy unbounded work.
+  getCveAdvisories(name, versions, budget) {
     if (!Array.isArray(versions) || versions.length === 0) {
       throw new Error(
         'security-filter: getCveAdvisories() requires a non-empty versions array',
       );
     }
     const cves = this._blocklist.get(name)?.cves ?? [];
+    if (budget && cves.length > 0) {
+      budget.remaining -= cves.length * versions.length;
+      if (budget.remaining < 0) {
+        throw Object.assign(
+          new Error('advisory check budget exhausted for this request'),
+          {code: 'ADVISORY_BUDGET'},
+        );
+      }
+    }
     return cves.filter(cve =>
       versions.some(v => this._cveVersionAffected(v, cve)),
     );
@@ -354,13 +421,15 @@ class MaliciousPackageStore {
     const entry = this._blocklist.get(name);
     if (!entry) return null;
 
-    if (
-      entry.vulnerableVersions &&
-      versionSatisfies(version, entry.vulnerableVersions) &&
-      this._malPassesConfidenceFilters(entry)
-    ) {
-      return {type: 'mal', malIds: entry.malIds};
-    }
+    const malIds = (entry.mals ?? [])
+      .filter(
+        mal =>
+          mal.vulnerableVersions &&
+          versionSatisfies(version, mal.vulnerableVersions) &&
+          this._malPassesConfidenceFilters(mal),
+      )
+      .map(mal => mal.id);
+    if (malIds.length > 0) return {type: 'mal', malIds};
 
     for (const cve of entry.cves ?? []) {
       if (!this._cveVersionAffected(version, cve)) continue;
@@ -383,11 +452,12 @@ class MaliciousPackageStore {
   // originCount/osv.malware.sources combine as independent AND: count is
   // computed over ALL origins regardless of source; the source check (when
   // osv.malware.sources is non-empty) is separate and requires only one match.
-  _malPassesConfidenceFilters(entry) {
-    if ((entry.originCount ?? 0) < this.malOriginCountMin) return false;
+  // Applied per MAL advisory, since each carries its own origins.
+  _malPassesConfidenceFilters(mal) {
+    if ((mal.originCount ?? 0) < this.malOriginCountMin) return false;
     if (
       this.malSources.length > 0 &&
-      !(entry.sources ?? []).some(s => this.malSources.includes(s))
+      !(mal.sources ?? []).some(s => this.malSources.includes(s))
     )
       return false;
     return true;
@@ -480,6 +550,7 @@ class MaliciousPackageStore {
       return; // real process.exit() never returns; this only matters for the injected test double
     }
 
+    this._warmStarted = true;
     if (cmp === 0) {
       this._bootstrapCompletedAt = stateItem.bootstrapCompletedAt ?? null;
       this._lastSyncedModifiedId = stateItem.lastSyncedModifiedId ?? null;
@@ -511,35 +582,110 @@ class MaliciousPackageStore {
   // cycles don't align. No leader election between replicas: every write
   // below is idempotent, so both pods syncing independently just means some
   // harmless redundant work, not a correctness issue.
-  _scheduleNext() {
+  // The very first bootstrap attempt (never tried yet) fires essentially
+  // immediately -- zero protection until it completes is worse than any
+  // delay could justify. Every failed cycle before bootstrap completes
+  // backs off from there on a faster capped schedule than waiting a full
+  // poll interval between tries -- counted from failures of any kind,
+  // including a store that can't be reached at all, so an outage is
+  // retried every 30s, 60s, 120s ... rather than in a tight loop.
+  _nextDelayMs() {
     const jitter = (Math.random() * 2 - 1) * this.pollJitterMs;
-    // The very first bootstrap attempt (never tried yet) fires essentially
-    // immediately -- zero protection until it completes is worse than any
-    // delay could justify. Only a *failed* bootstrap attempt backs off, on a
-    // faster capped schedule than waiting a full poll interval between tries.
     let baseDelay;
     if (this._bootstrapCompletedAt) {
       baseDelay = this.pollIntervalMs;
-    } else if (this._bootstrapAttempt === 0) {
+    } else if (this._consecutiveFailures === 0) {
       baseDelay = 0;
     } else {
       baseDelay = Math.min(
         this.pollIntervalMs,
-        30000 * 2 ** (this._bootstrapAttempt - 1),
+        30000 * 2 ** (this._consecutiveFailures - 1),
       );
     }
-    const delay = Math.max(0, baseDelay + jitter);
+    return Math.max(0, baseDelay + jitter);
+  }
+
+  _scheduleNext() {
+    const delay = this._nextDelayMs();
     this._timer = setTimeout(() => {
-      this.runSyncCycle()
-        .catch(err =>
-          this.logger.warn(
-            {err: err.message},
-            'security-filter: osv -- sync cycle failed',
-          ),
-        )
-        .finally(() => this._scheduleNext());
+      this._tick().finally(() => this._scheduleNext());
     }, delay);
     this._timer.unref?.(); // don't keep the process (or a test run) alive solely for this timer
+  }
+
+  // One scheduled cycle: runs it and records how it went.
+  async _tick() {
+    let ok;
+    try {
+      ok = await this.runSyncCycle();
+    } catch (err) {
+      this.logger.warn(
+        {err: err.message},
+        'security-filter: osv -- sync cycle failed',
+      );
+      ok = false;
+    }
+    this._recordCycleResult(ok);
+  }
+
+  // `ok` is true for a cycle that did its job, false for a failed one, and
+  // null for one that deliberately sat out (a newer schema elsewhere).
+  // After staleAfterCycles failures in a row, raises the alarm once, and
+  // says so again when a cycle next succeeds.
+  _recordCycleResult(ok) {
+    if (ok === null) return;
+    if (ok) {
+      if (this._staleAlarmRaised) {
+        this.logger.warn(
+          {failures: this._consecutiveFailures},
+          'security-filter: osv -- sync recovered after @{failures} failed cycles',
+        );
+        sendWebhook(
+          this.webhookConfig,
+          {
+            event: 'osv_sync_recovered',
+            failures: this._consecutiveFailures,
+            reason: `OSV sync recovered after ${this._consecutiveFailures} failed cycles.`,
+          },
+          this.logger,
+        );
+      }
+      this._consecutiveFailures = 0;
+      this._staleAlarmRaised = false;
+      this._lastSuccessAt = new Date().toISOString();
+      return;
+    }
+    this._consecutiveFailures += 1;
+    if (
+      this.staleAfterCycles > 0 &&
+      this._consecutiveFailures >= this.staleAfterCycles &&
+      !this._staleAlarmRaised
+    ) {
+      this._staleAlarmRaised = true;
+      const since = this._lastSuccessAt ?? 'this pod started';
+      const reason =
+        `SECURITY ALERT: the OSV blocklist sync has failed ${this._consecutiveFailures} cycles in a row ` +
+        `(last success: ${since}${this._bootstrapCompletedAt ? '' : ', bootstrap never completed'}). ` +
+        'Advisories published since then are not being blocked.';
+      this.logger.error(
+        {
+          failures: this._consecutiveFailures,
+          lastSuccessAt: this._lastSuccessAt,
+          bootstrapped: !!this._bootstrapCompletedAt,
+        },
+        'security-filter: osv -- sync has failed @{failures} cycles in a row, the blocklist is going stale',
+      );
+      sendWebhook(
+        this.webhookConfig,
+        {
+          event: 'osv_sync_stale',
+          failures: this._consecutiveFailures,
+          lastSuccessAt: this._lastSuccessAt ?? '',
+          reason,
+        },
+        this.logger,
+      );
+    }
   }
 
   // One version check per cycle, not one per package -- a race with some
@@ -549,7 +695,13 @@ class MaliciousPackageStore {
   // finishes (which runs slower than an incremental cycle anyway, so it's
   // still the one that lands last). Not worth a getItem() per package to
   // guard against.
+  //
+  // Resolves true when the cycle did its job, false when it failed, null
+  // when it sat out. A warm start that failed at startup (the store was
+  // unreachable) is retried first, so a brief outage doesn't turn into a
+  // full re-bootstrap over data the store already holds.
   async runSyncCycle() {
+    if (!this._warmStarted) await this._warmStart();
     const stateItem = await this.store.getItem(SYNC_STATE_KEY);
     if (compareSchemaVersion(stateItem?.extractionSchemaVersion) === 1) {
       this.logger.warn(
@@ -559,15 +711,13 @@ class MaliciousPackageStore {
         },
         'security-filter: osv -- shared state has moved to a newer extraction schema (@{storedVersion} > @{currentVersion}) since this pod started -- skipping this sync cycle',
       );
-      return;
+      return null;
     }
 
     if (!this._bootstrapCompletedAt) {
-      this._bootstrapAttempt += 1;
-      await this._runBootstrap();
-    } else {
-      await this._runIncrementalSync();
+      return this._runBootstrap();
     }
+    return this._runIncrementalSync();
   }
 
   // First-ever run (the backend has no bootstrapCompletedAt yet): walk the
@@ -583,7 +733,20 @@ class MaliciousPackageStore {
   // finished blocklist already lives in memory permanently after bootstrap
   // (see _applyToMemory) -- this just realizes that same footprint slightly
   // earlier, before writes start rather than only after.
+  //
+  // The watermark is the newest `modified` among the zip's own records, not
+  // modified_id.csv's newest row: rows newer than the zip snapshot belong
+  // to records the zip didn't carry, so the first incremental cycle (with
+  // no stored etag, a full CSV read) fetches every one of them.
+  //
+  // Every record is enforced in this pod's memory at once, written or not.
+  // Bootstrap only counts as complete once the store holds every item; the
+  // ones it refused are retried next cycle, on their own, before anything
+  // else, and sibling pods that warm-start from the store meanwhile see
+  // bootstrap as incomplete rather than a blocklist with holes in it.
   async _runBootstrap() {
+    if (this._pendingBootstrapItems) return this._writeBootstrapItems();
+
     let maxModified = null;
     const staging = new Map(); // pkgName -> item, merged across MAL + CVE records
 
@@ -591,6 +754,7 @@ class MaliciousPackageStore {
       for await (const record of osvClient.fetchAllRecords({
         baseUrl: this.baseUrl,
         timeoutMs: this.requestTimeoutMs,
+        maxBytes: this.maxDownloadBytes,
         logger: this.logger,
       })) {
         // Bootstrap builds from scratch -- a withdrawn record (no `packages`
@@ -604,10 +768,9 @@ class MaliciousPackageStore {
         for (const pkg of record.packages) {
           const item = staging.get(pkg.name) ?? {pk: pkg.name};
           if (isMal) {
-            item.vulnerableVersions = pkg.vulnerableVersions;
-            item.malIds = [record.id];
-            item.originCount = pkg.originCount;
-            item.sources = pkg.sources;
+            item.mals = (item.mals ?? [])
+              .filter(mal => mal.id !== record.id)
+              .concat(malEntry(record, pkg));
           } else {
             item.cves = (item.cves ?? []).concat({
               id: record.id,
@@ -628,61 +791,39 @@ class MaliciousPackageStore {
         {err: err.message},
         'security-filter: osv -- bootstrap failed, will retry',
       );
-      return; // don't set bootstrapCompletedAt -- next tick retries from scratch
+      return false; // don't set bootstrapCompletedAt -- next tick retries from scratch
     }
 
     const items = Array.from(staging.values());
-    const count = items.length;
-    const unwritten = await this.store.putItems(items);
-    const failedKeys = new Set(unwritten.map(it => it.pk));
-    for (const item of items) {
-      if (!failedKeys.has(item.pk)) this._applyToMemory(item);
-    }
-    const failedCount = failedKeys.size;
+    for (const item of items) this._applyToMemory(item);
+    this._bootstrapWatermark = maxModified;
+    this._bootstrapCount = items.length;
+    this._pendingBootstrapItems = items;
+    return this._writeBootstrapItems();
+  }
 
-    // Seed the CSV etag/high-water-mark so steady-state sync starts here,
-    // rather than re-deriving it from a separate first incremental cycle.
-    let csvEtag = null;
-    let csvLastModified = null;
-    try {
-      const csvResult = await osvClient.fetchModifiedCsv({
-        baseUrl: this.baseUrl,
-        timeoutMs: this.requestTimeoutMs,
-      });
-      if (!csvResult.notModified) {
-        csvEtag = csvResult.etag;
-        csvLastModified = csvResult.lastModified;
-        if (
-          csvResult.rows.length > 0 &&
-          (!maxModified || csvResult.rows[0].modified > maxModified)
-        ) {
-          maxModified = csvResult.rows[0].modified;
-        }
-      }
-    } catch (err) {
-      this.logger.warn(
-        {err: err.message},
-        'security-filter: osv -- failed to seed modified_id.csv state after bootstrap',
+  async _writeBootstrapItems() {
+    const unwritten = await this.store.putItems(this._pendingBootstrapItems);
+    if (unwritten.length > 0) {
+      this._pendingBootstrapItems = unwritten;
+      this.logger.error(
+        {count: this._bootstrapCount, failedCount: unwritten.length},
+        'security-filter: osv -- bootstrap has unwritten entries, @{failedCount} of @{count} failed; retrying them next cycle',
       );
+      return false;
     }
+    this._pendingBootstrapItems = null;
 
     this._bootstrapCompletedAt = new Date().toISOString();
-    this._lastSyncedModifiedId = maxModified;
-    this._csvEtag = csvEtag;
-    this._csvLastModified = csvLastModified;
+    this._lastSyncedModifiedId = this._bootstrapWatermark;
+    this._csvEtag = null;
+    this._csvLastModified = null;
     await this._writeSyncState();
-
-    if (failedCount > 0) {
-      this.logger.error(
-        {count, failedCount},
-        'security-filter: osv -- bootstrap completed with unwritten entries, @{failedCount} of @{count} failed',
-      );
-    } else {
-      this.logger.info(
-        {count},
-        'security-filter: osv -- bootstrap completed, @{count} entries loaded',
-      );
-    }
+    this.logger.info(
+      {count: this._bootstrapCount},
+      'security-filter: osv -- bootstrap completed, @{count} entries loaded',
+    );
+    return true;
   }
 
   // Steady-state: conditional GET on modified_id.csv. A 304 means nothing
@@ -704,10 +845,10 @@ class MaliciousPackageStore {
         {err: err.message},
         'security-filter: osv -- failed to check modified_id.csv, will retry next cycle',
       );
-      return;
+      return false;
     }
 
-    if (csvResult.notModified) return;
+    if (csvResult.notModified) return true;
 
     const {rows, etag, lastModified} = csvResult;
     if (rows.length === 0) {
@@ -717,7 +858,7 @@ class MaliciousPackageStore {
       this._csvEtag = etag;
       this._csvLastModified = lastModified;
       await this._writeSyncState();
-      return;
+      return true;
     }
 
     let allApplied = true;
@@ -738,12 +879,7 @@ class MaliciousPackageStore {
           const applied = await this._upsertPackage(
             pkg.name,
             isMal
-              ? {
-                  vulnerableVersions: pkg.vulnerableVersions,
-                  malIds: [record.id],
-                  originCount: pkg.originCount,
-                  sources: pkg.sources,
-                }
+              ? {mal: malEntry(record, pkg)}
               : {
                   cveEntry: {
                     id: record.id,
@@ -793,6 +929,7 @@ class MaliciousPackageStore {
       this._csvLastModified = lastModified;
       await this._writeSyncState();
     }
+    return allApplied;
   }
 
   // Read-modify-write for a single changed package during incremental sync:
@@ -814,16 +951,17 @@ class MaliciousPackageStore {
       return false;
     }
 
+    // Each advisory replaces only its own entry: a package flagged by two
+    // MAL advisories keeps both, and an update to one leaves the other as is.
     const merged = {...existing, pk: pkgName};
     if (delta.cveEntry) {
       merged.cves = (existing.cves ?? [])
         .filter(c => c.id !== delta.cveEntry.id)
         .concat(delta.cveEntry);
     } else {
-      merged.vulnerableVersions = delta.vulnerableVersions;
-      merged.malIds = delta.malIds;
-      merged.originCount = delta.originCount;
-      merged.sources = delta.sources;
+      merged.mals = (existing.mals ?? [])
+        .filter(mal => mal.id !== delta.mal.id)
+        .concat(delta.mal);
     }
     merged.modified = new Date().toISOString();
 
@@ -850,74 +988,87 @@ class MaliciousPackageStore {
   // of alerts on a fresh pod's first boot for advisories that predate this
   // registry ever caching anything, which is noise, not signal. Steady-
   // state incremental syncs are where "new OSV data" genuinely means new.
+  //
+  // Reads raw local metadata (storage.localStorage.getPackageMetadata), not
+  // storage.getPackage(): that one runs every filter_metadata() first, and
+  // security-filter's own filter would already have removed the very
+  // version this alert exists to report.
   _checkAgainstLocalStorage(pkgName, delta) {
     if (!this.registryStorage) return; // not attached yet -- see attachRegistryStorage()
+    const localStorage = this.registryStorage.localStorage;
+    if (typeof localStorage?.getPackageMetadata !== 'function') {
+      if (!this._warnedNoLocalStorage) {
+        this._warnedNoLocalStorage = true;
+        this.logger.error(
+          {},
+          'security-filter: osv -- this Verdaccio storage has no localStorage.getPackageMetadata, cached packages are not re-checked against new advisories',
+        );
+      }
+      return;
+    }
 
-    this.registryStorage.getPackage({
-      name: pkgName,
-      uplinksLook: false, // local storage only -- never triggers an uplink fetch
-      callback: (err, pkg) => {
-        if (err || !pkg?.versions) return; // not cached locally -- nothing to alert on
+    localStorage.getPackageMetadata(pkgName, (err, pkg) => {
+      if (err || !pkg?.versions) return; // not cached locally -- nothing to alert on
 
-        for (const ver of Object.keys(pkg.versions)) {
-          if (delta.cveEntry) {
-            if (
-              !this._cveVersionAffected(ver, delta.cveEntry) ||
-              !this._cveMatchesFilters(delta.cveEntry)
-            )
-              continue;
-            const {cveId, severity, cweIds} = delta.cveEntry;
-            const reason =
-              `SECURITY ALERT: ${pkgName}@${ver}, already cached in this registry, now matches known ` +
-              `vulnerability ${cveId ?? delta.cveEntry.id} (${severity ?? 'unknown severity'}` +
-              `${cweIds?.length ? ', ' + cweIds.join(', ') : ''}) from OSV.`;
-            this.logger.fatal(
-              {pkg: pkgName, ver, cveId, severity, cweIds},
-              'security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! @{pkg}@@{ver} matches known vulnerability ' +
-                '@{cveId} [@{severity}, @{cweIds}] (OSV) -- already in local storage',
-            );
-            sendWebhook(
-              this.webhookConfig,
-              {
-                event: 'osv_retroactive_cve',
-                pkg: pkgName,
-                ver,
-                cveId,
-                severity,
-                cweIds: (cweIds ?? []).join(', '),
-                reason,
-              },
-              this.logger,
-            );
-          } else {
-            if (
-              !delta.vulnerableVersions ||
-              !versionSatisfies(ver, delta.vulnerableVersions) ||
-              !this._malPassesConfidenceFilters(delta)
-            )
-              continue;
-            const reason =
-              `SECURITY ALERT: ${pkgName}@${ver}, already cached in this registry, now matches known-` +
-              `malicious-package advisory (${delta.malIds.join(', ')}) from OSV.`;
-            this.logger.fatal(
-              {pkg: pkgName, ver, malIds: delta.malIds},
-              'security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! @{pkg}@@{ver} matches known-malicious-' +
-                'package advisory [@{malIds}] (OSV) -- already in local storage',
-            );
-            sendWebhook(
-              this.webhookConfig,
-              {
-                event: 'osv_retroactive_mal',
-                pkg: pkgName,
-                ver,
-                malIds: delta.malIds.join(', '),
-                reason,
-              },
-              this.logger,
-            );
-          }
+      for (const ver of Object.keys(pkg.versions)) {
+        if (delta.cveEntry) {
+          if (
+            !this._cveVersionAffected(ver, delta.cveEntry) ||
+            !this._cveMatchesFilters(delta.cveEntry)
+          )
+            continue;
+          const {cveId, severity, cweIds} = delta.cveEntry;
+          const reason =
+            `SECURITY ALERT: ${pkgName}@${ver}, already cached in this registry, now matches known ` +
+            `vulnerability ${cveId ?? delta.cveEntry.id} (${severity ?? 'unknown severity'}` +
+            `${cweIds?.length ? ', ' + cweIds.join(', ') : ''}) from OSV.`;
+          this.logger.fatal(
+            {pkg: pkgName, ver, cveId, severity, cweIds},
+            'security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! @{pkg}@@{ver} matches known vulnerability ' +
+              '@{cveId} [@{severity}, @{cweIds}] (OSV) -- already in local storage',
+          );
+          sendWebhook(
+            this.webhookConfig,
+            {
+              event: 'osv_retroactive_cve',
+              pkg: pkgName,
+              ver,
+              cveId,
+              severity,
+              cweIds: (cweIds ?? []).join(', '),
+              reason,
+            },
+            this.logger,
+          );
+        } else {
+          const {mal} = delta;
+          if (
+            !mal.vulnerableVersions ||
+            !versionSatisfies(ver, mal.vulnerableVersions) ||
+            !this._malPassesConfidenceFilters(mal)
+          )
+            continue;
+          const reason =
+            `SECURITY ALERT: ${pkgName}@${ver}, already cached in this registry, now matches known-` +
+            `malicious-package advisory (${mal.id}) from OSV.`;
+          this.logger.fatal(
+            {pkg: pkgName, ver, malIds: [mal.id]},
+            'security-filter: !!! CACHED PACKAGE NOW FLAGGED !!! @{pkg}@@{ver} matches known-malicious-' +
+              'package advisory [@{malIds}] (OSV) -- already in local storage',
+          );
+          sendWebhook(
+            this.webhookConfig,
+            {
+              event: 'osv_retroactive_mal',
+              pkg: pkgName,
+              ver,
+              malIds: mal.id,
+              reason,
+            },
+            this.logger,
+          );
         }
-      },
+      }
     });
   }
 
@@ -931,15 +1082,12 @@ class MaliciousPackageStore {
     const isMal = osvClient.isMalRecord(id);
     for (const [pkgName, entry] of this._blocklist) {
       if (isMal) {
-        if (!entry.malIds?.includes(id)) continue;
-        const remainingIds = entry.malIds.filter(malId => malId !== id);
-        if (remainingIds.length > 0) {
-          entry.malIds = remainingIds;
+        if (!entry.mals?.some(mal => mal.id === id)) continue;
+        const remainingMals = entry.mals.filter(mal => mal.id !== id);
+        if (remainingMals.length > 0) {
+          entry.mals = remainingMals;
         } else {
-          delete entry.vulnerableVersions;
-          delete entry.malIds;
-          delete entry.originCount;
-          delete entry.sources;
+          delete entry.mals;
         }
       } else {
         if (!entry.cves?.some(c => c.id === id)) continue;
@@ -951,7 +1099,7 @@ class MaliciousPackageStore {
         }
       }
 
-      if (entry.malIds === undefined && entry.cves === undefined) {
+      if (entry.mals === undefined && entry.cves === undefined) {
         await this.store.deleteItem(pkgName);
         this._blocklist.delete(pkgName);
         this.logger.info(
@@ -979,11 +1127,7 @@ class MaliciousPackageStore {
   // never consults.
   _applyToMemory(item) {
     const entry = {};
-    if (item.vulnerableVersions !== undefined)
-      entry.vulnerableVersions = item.vulnerableVersions;
-    if (item.malIds !== undefined) entry.malIds = item.malIds;
-    if (item.originCount !== undefined) entry.originCount = item.originCount;
-    if (item.sources !== undefined) entry.sources = item.sources;
+    if (item.mals !== undefined) entry.mals = item.mals;
     if (item.cves !== undefined) entry.cves = item.cves;
     this._blocklist.set(item.pk, entry);
   }

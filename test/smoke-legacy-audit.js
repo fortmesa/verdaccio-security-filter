@@ -294,6 +294,97 @@ async function main() {
     },
   );
 
+  // A graph where every package requires every other has a number of
+  // distinct paths exponential in its size: 12 packages here is about a
+  // 1.5 KB body and, enumerated path by path, minutes of event-loop time.
+  function completeGraph(size) {
+    const names = Array.from({length: size}, (_, i) => `p${i}`);
+    const dependencies = {};
+    for (const name of names) {
+      dependencies[name] = {
+        version: '1.0.0',
+        requires: Object.fromEntries(
+          names.filter(n => n !== name).map(n => [n, '^1.0.0']),
+        ),
+      };
+    }
+    return {requires: {[names[0]]: '^1.0.0'}, dependencies};
+  }
+
+  await check(
+    'a graph whose path count is exponential is walked once per node, and answers at once',
+    () => {
+      const started = Date.now();
+      const report = buildLegacyAuditReport(
+        completeGraph(12),
+        fakeStore({p5: [cve()]}),
+      );
+      assert.ok(Date.now() - started < 1000, `took ${Date.now() - started}ms`);
+      const [finding] = report.advisories['GHSA-test-0000'].findings;
+      assert.equal(finding.version, '1.0.0');
+      assert.ok(finding.paths.length >= 1 && finding.paths.length <= 100);
+      assert.ok(finding.paths.every(p => p.endsWith('p5')));
+    },
+  );
+
+  await check(
+    'a walk past maxVisits throws AUDIT_VISIT_BUDGET instead of returning part of the graph',
+    () => {
+      assert.throws(
+        () =>
+          buildLegacyAuditReport(completeGraph(12), fakeStore({}), {
+            maxVisits: 50,
+          }),
+        err => err.code === 'AUDIT_VISIT_BUDGET',
+      );
+    },
+  );
+
+  await check(
+    'each package is looked up in the store once however many paths reach it',
+    () => {
+      const lookups = new Map();
+      const store = fakeStore({p3: [cve()]});
+      const counting = {
+        getCveAdvisories(name, versions, budget) {
+          lookups.set(name, (lookups.get(name) ?? 0) + 1);
+          return store.getCveAdvisories(name, versions, budget);
+        },
+      };
+      buildLegacyAuditReport(completeGraph(8), counting);
+      assert.ok([...lookups.values()].every(count => count === 1));
+      assert.equal(lookups.size, 8);
+    },
+  );
+
+  await check(
+    'a package first reached at the depth limit is still walked from a shorter path that reaches it later',
+    () => {
+      // A chain of 40 packages reaches `shared` exactly at the depth limit
+      // first (the walk takes the chain before the shortcut); the shortcut
+      // reaches it at depth 1, and only `shared` requires the vulnerable
+      // package.
+      const dependencies = {};
+      const chain = Array.from({length: 40}, (_, i) => `c${i}`);
+      chain.forEach((name, i) => {
+        dependencies[name] = {
+          version: '1.0.0',
+          requires: {[chain[i + 1] ?? 'shared']: '^1.0.0'},
+        };
+      });
+      dependencies.shortcut = {version: '1.0.0', requires: {shared: '^1.0.0'}};
+      dependencies.shared = {version: '1.0.0', requires: {vuln: '^1.0.0'}};
+      dependencies.vuln = {version: '1.0.0'};
+      const report = buildLegacyAuditReport(
+        {requires: {c0: '^1.0.0', shortcut: '^1.0.0'}, dependencies},
+        fakeStore({vuln: [cve()]}),
+      );
+      const advisory = report.advisories['GHSA-test-0000'];
+      assert.ok(advisory, 'vuln is reported');
+      assert.deepEqual(advisory.findings[0].paths, ['shortcut>shared>vuln']);
+    },
+  );
+
   console.log(`\n${passed} check(s) passed.`);
 }
 

@@ -97,11 +97,18 @@ async function waitForUp(url, timeoutMs = 20000) {
   throw new Error(`verdaccio never came up at ${url}`);
 }
 
+// VERDACCIO_BIN points the run at another Verdaccio build, e.g. the one
+// fm-npmjs deploys (../fm-npmjs/node_modules/verdaccio/bin/verdaccio), as
+// test/verdaccio.js does.
 function startVerdaccio(configPath, port) {
-  const bin = path.join(PLUGIN_ROOT, 'node_modules', '.bin', 'verdaccio');
-  const proc = spawn(bin, ['--config', configPath, '--listen', String(port)], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const bin =
+    process.env.VERDACCIO_BIN ??
+    path.join(PLUGIN_ROOT, 'node_modules', 'verdaccio', 'bin', 'verdaccio');
+  const proc = spawn(
+    process.execPath,
+    [bin, '--config', configPath, '--listen', String(port)],
+    {stdio: ['ignore', 'pipe', 'pipe']},
+  );
   let output = '';
   proc.stdout.on('data', d => (output += d));
   proc.stderr.on('data', d => (output += d));
@@ -303,7 +310,24 @@ function makeYarnClassicClient() {
 // below are each major's latest stable release, confirmed to actually
 // resolve via corepack (it downloads the real release from
 // repo.yarnpkg.com on first use, cached by corepack itself afterward).
+// Yarn berry reads ~/.yarnrc.yml, so each version runs with a HOME of its
+// own: settings in the real one (an age gate an older yarn doesn't know,
+// another registry) otherwise leak into the run or fail it outright. The
+// real corepack cache stays in use, so no yarn release is downloaded again.
+function berryEnv(version) {
+  const home = path.join(WORKDIR, `home-yarn-${version}`);
+  fs.mkdirSync(home, {recursive: true});
+  return {
+    ...process.env,
+    HOME: home,
+    COREPACK_HOME:
+      process.env.COREPACK_HOME ??
+      path.join(os.homedir(), '.cache', 'node', 'corepack'),
+  };
+}
+
 function makeYarnBerryClient(version, label) {
+  const env = berryEnv(version);
   return {
     name: `yarn ${label} (${version})`,
     // Confirmed via real testing: yarn 2.x/3.x's own `yarn npm audit` never
@@ -317,19 +341,24 @@ function makeYarnBerryClient(version, label) {
     setup: dir => writeYarnBerryRc(dir, version),
     publish(dir) {
       setYarnBerryPackageManager(dir, version);
-      const pre = spawnSync('yarn', ['install'], {cwd: dir, encoding: 'utf8'});
+      const pre = spawnSync('yarn', ['install'], {
+        cwd: dir,
+        encoding: 'utf8',
+        env,
+      });
       if (pre.status !== 0) return pre;
       return spawnSync('yarn', ['npm', 'publish'], {
         cwd: dir,
         encoding: 'utf8',
+        env,
       });
     },
     install(dir) {
       setYarnBerryPackageManager(dir, version);
-      return spawnSync('yarn', ['install'], {cwd: dir, encoding: 'utf8'});
+      return spawnSync('yarn', ['install'], {cwd: dir, encoding: 'utf8', env});
     },
     audit: dir =>
-      spawnSync('yarn', ['npm', 'audit'], {cwd: dir, encoding: 'utf8'}),
+      spawnSync('yarn', ['npm', 'audit'], {cwd: dir, encoding: 'utf8', env}),
   };
 }
 

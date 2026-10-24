@@ -5,14 +5,19 @@ on:
     tags:
       - 'v*.*.*'
 
+# Jobs without their own permissions: block get only this.
+permissions:
+  contents: read
+
 jobs:
-  # S3-read only -- the ONLY job in this workflow that runs untrusted
-  # install-time code (yarn/npm lifecycle scripts, the "Shai-Hulud" class of
-  # supply-chain attack). test/release/publish-npm below never run yarn
-  # install themselves anymore -- they just restore this job's node_modules
-  # from cache -- so none of them ever execute a compromised dependency's
-  # postinstall script in a job that also holds contents:write or an
-  # npm-publish token.
+  # S3-read only -- the ONLY job in this workflow that installs
+  # dependencies; test/release/publish-npm/publish-npmjs below restore its
+  # node_modules from cache. It installs with --mode=skip-build, so no
+  # dependency's install-time script (the "Shai-Hulud" class of
+  # supply-chain attack) runs here either. That matters because this job
+  # holds id-token: write for the gha-install role, and with it a script
+  # could mint a GitHub OIDC token for the npmjs.dev.fort.blue audience,
+  # which that registry accepts as a publish credential for this repo.
   install:
     name: Install
     runs-on: ubuntu-slim
@@ -32,6 +37,18 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false # don't leave a git credential for a malicious postinstall to scrape
+
+      # A tag that doesn't match package.json would publish the wrong
+      # version (or 409 on one already published) while still creating a
+      # GitHub release under the tag.
+      - name: Check the tag matches the package version
+        run: |
+          set -eu
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $VERSION" >&2
+            exit 1
+          fi
 
       - name: Enable corepack
         run: corepack enable
@@ -55,7 +72,7 @@ jobs:
       # downloaded copy can be deleted right after.
       - name: Install yarn-plugin-yarnstatic-s3 (pinned + checksum-verified)
         env:
-          YARNSTATIC_VERSION: v1.0.2
+          YARNSTATIC_VERSION: v1.1.2
         run: |
           set -eu
           PREFIX="s3://fmdev-npmjs-storage/fortmesa/yarnstatic/${YARNSTATIC_VERSION}"
@@ -75,7 +92,7 @@ jobs:
         env:
           YARNSTATIC_BUCKET: fmdev-npmjs-storage
           YARNSTATIC_KEY_PREFIX: verdaccio
-        run: yarn install --immutable
+        run: yarn install --immutable --mode=skip-build
 
       # .yarn/install-state.gz travels with node_modules so Yarn recognizes
       # the tree as already-installed downstream and never tries an implicit
@@ -89,13 +106,21 @@ jobs:
           key: node-modules-${{ github.sha }}
 
   test:
-    name: Test
+    name: Test (Node ${{ matrix.node }})
     needs: install
     runs-on: ubuntu-slim
+    strategy:
+      matrix:
+        # 22.12.0 is package.json's engines floor; 24 is what fm-npmjs runs.
+        node: ['22.12.0', '24']
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
 
       - name: Enable corepack
         run: corepack enable
@@ -116,6 +141,13 @@ jobs:
     name: Publish npm package
     needs: test
     runs-on: ubuntu-slim
+    # In the npmjs environment, this job's OIDC token carries
+    # sub: repo:fortmesa/verdaccio-security-filter:environment:npmjs. The
+    # registry's allow entry for this repo pins that sub, so a token minted
+    # by any other job in this repo (the install job's sub ends in
+    # :environment:install) is refused. The environment's v*.*.* tag rule
+    # applies here as it does to publish-npmjs.
+    environment: npmjs
     permissions:
       contents: read
       id-token: write
@@ -164,8 +196,83 @@ jobs:
           yarn config set 'npmScopes.fortmesa.npmAlwaysAuth' true
           yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
 
+      # npm rejects republishing a version, so a re-run of this job after a
+      # publish that landed must skip instead of failing. 200 means already
+      # published, 404 means publish, anything else fails the job.
+      - name: Check whether this version is already published
+        id: version-check
+        env:
+          NPM_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -eu
+          VERSION=$(node -p "require('./package.json').version")
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $NPM_TOKEN" \
+            "https://npmjs.dev.fort.blue/@fortmesa%2fverdaccio-security-filter/$VERSION")
+          case "$STATUS" in
+            200) echo "should-publish=false" >> "$GITHUB_OUTPUT"; echo "$VERSION is already published -- skipping" ;;
+            404) echo "should-publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "unexpected HTTP $STATUS from npmjs.dev.fort.blue for $VERSION" >&2; exit 1 ;;
+          esac
+
       - name: Publish to npmjs.dev.fort.blue
+        if: steps.version-check.outputs.should-publish == 'true'
         run: yarn npm publish --access public --provenance
+
+  publish-npmjs:
+    name: Stage on npmjs.org
+    needs: test
+    runs-on: ubuntu-slim
+    # The package's trusted publisher entry on npmjs.com names this
+    # environment, so npm only honors an OIDC token from a job running in
+    # it; the environment's v*.*.* tag rule limits which runs get one. npm
+    # trusted publishers can only stage, so a maintainer approves each
+    # version on npmjs.com with 2FA before it goes live.
+    environment: npmjs
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # No token is configured for registry.npmjs.org, so `yarn npm publish`
+      # trades this job's OIDC token for a short-lived stage token.
+      YARN_NPM_REGISTRY_SERVER: https://registry.npmjs.org
+      YARN_NPM_PUBLISH_REGISTRY: https://registry.npmjs.org
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Restore node_modules from install job
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            node_modules
+            .yarn/install-state.gz
+          key: node-modules-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      # A staged version stays off the registry until it's approved, so this
+      # still answers 404 for one; approve or reject a pending stage on
+      # npmjs.com before re-running this job.
+      - name: Check whether this version is already on npmjs.org
+        id: version-check
+        run: |
+          set -eu
+          VERSION=$(node -p "require('./package.json').version")
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://registry.npmjs.org/@fortmesa%2fverdaccio-security-filter/$VERSION")
+          case "$STATUS" in
+            200) echo "should-publish=false" >> "$GITHUB_OUTPUT"; echo "$VERSION is already on npmjs.org -- skipping" ;;
+            404) echo "should-publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "unexpected HTTP $STATUS from registry.npmjs.org for $VERSION" >&2; exit 1 ;;
+          esac
+
+      - name: Stage on npmjs.org for approval
+        if: steps.version-check.outputs.should-publish == 'true'
+        run: yarn npm publish --access public --provenance --staged
 
   release:
     name: Create release
@@ -197,15 +304,31 @@ jobs:
           # Same tarball publish-npm uploads to npmjs.dev.fort.blue, attached
           # here too so it can be inspected/downloaded without registry
           # access, and outlives that registry's own retention policy.
-          yarn pack -o "dist/verdaccio-security-filter-${{ github.ref_name }}.tgz"
+          # The tag comes from GITHUB_REF_NAME, never substituted into the
+          # script, so a tag name can't inject shell.
+          yarn pack -o "dist/verdaccio-security-filter-$GITHUB_REF_NAME.tgz"
 
       - name: Generate checksums
         working-directory: dist
         run: sha256sum * > checksums.txt
 
       - name: Create release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
-        with:
-          files: dist/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # Replaces the action's fail_on_unmatched_files. With no match, bash
+          # passes the literal string dist/* to gh and the upload fails late.
+          ls dist/* >/dev/null
+          # A re-run finds the release its first attempt made and replaces
+          # the assets on it, rather than failing on create. --verify-tag
+          # fails if the tag is gone, where gh would otherwise create it at
+          # the default branch, a different commit from the one built.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes
+          fi

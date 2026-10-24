@@ -42,7 +42,9 @@ filters:
       pollSeconds: 900
       pollJitter: 90
       baseUrl: 'https://osv-vulnerabilities.storage.googleapis.com/npm/'
-      requestTimeoutSeconds: 30
+      requestTimeoutSeconds: 30 # stall timeout: a download that receives nothing for this long fails
+      maxDownloadMB: 512 # largest all.zip the bootstrap accepts (219MB on 2026-10-24)
+      staleAfterCycles: 4 # failed sync cycles in a row before the stale alarm; 0 turns it off
       blockStrategy: remove # 'remove' (default) | 'replace'
       # Storage backend -- see "Storage backends" below. Auto-selected from
       # whichever of redis/dynamo/filesystem is configured (priority in that
@@ -201,9 +203,16 @@ in memory past that single step.
 
 **Sync mechanism**:
 
-- **Bootstrap** (first-ever run against an empty storage backend): downloads the
-  full `npm/all.zip` once, extracts minimal fields per non-withdrawn `MAL-`
-  record, and batch-writes them to the configured backend.
+- **Bootstrap** (first run against an empty storage backend): downloads
+  `npm/all.zip` once, extracts the minimal fields of every non-withdrawn `MAL-`
+  and `GHSA-` record, and batch-writes them to the configured backend. Each
+  record is enforced in this pod's memory as soon as it's extracted. Bootstrap
+  only counts as complete once the backend has accepted every item; the items it
+  refused are retried on their own next cycle, without downloading the zip
+  again. The watermark it leaves is the newest `modified` time among the zip's
+  own records, and it stores no CSV etag, so the first steady-state cycle reads
+  `modified_id.csv` in full and fetches every record newer than the zip
+  snapshot.
 - **Steady-state** (every `osv.pollSeconds`, default 900s/15min, +/-
   `osv.pollJitter` jitter on every tick including the first): a conditional GET
   (`If-None-Match`/`If-Modified-Since`) against `npm/modified_id.csv`. **A
@@ -214,10 +223,31 @@ in memory past that single step.
 - **Withdrawal**: an advisory OSV later retracts is removed from the affected
   package's entry (or the whole entry, if it was the only contributing advisory)
   on the next cycle that observes the withdrawal.
+- **Failures**: a cycle that fails (an unreachable backend, a failed download, a
+  record that can't be fetched) leaves the watermark where it was, so the next
+  cycle covers the same window again. Before bootstrap completes, failed cycles
+  back off: 30s, 60s, 120s and so on, up to `osv.pollSeconds`. A warm start that
+  failed at startup is retried at the start of the next cycle, so a backend that
+  was briefly down doesn't cost a full re-bootstrap. After
+  `osv.staleAfterCycles` (default 4) failed cycles in a row the plugin logs at
+  `error` and fires the webhook with `event: osv_sync_stale`, once; the next
+  successful cycle fires `osv_sync_recovered`. `0` turns the alarm off.
+- **Downloads**: `osv.requestTimeoutSeconds` (default 30) is a stall timeout.
+  The timer restarts whenever bytes arrive, so a slow download that keeps moving
+  finishes, and one that goes silent, before the headers or partway through the
+  body, fails. `osv.maxDownloadMB` (default 512) caps `all.zip`, which bootstrap
+  holds in memory while it reads it (219MB on 2026-10-24). `modified_id.csv` is
+  capped at 64MB and a single record at 16MB.
 - Multiple replicas sync independently -- no leader election. Every write is an
   idempotent put/batch-write, so redundant work between replicas is harmless,
   and this avoids needing any distributed coordination for what's a low-volume
-  background job.
+  background job. One race is accepted rather than guarded against: an
+  incremental update reads a package's item, merges its change and writes the
+  whole item back, so two pods applying different advisories to the same package
+  at the same moment can lose one of them in the backend. Each pod keeps what it
+  applied in its own memory, but a pod that warm-starts from the backend
+  afterwards misses the lost one until that advisory changes again. It takes two
+  advisories for one package inside one poll window.
 
 **Per-request cost: zero.** `filter_metadata()` and the publish gate check a
 plain in-memory `Map` lookup plus a small `semver` comparison -- no network
@@ -306,6 +336,11 @@ Direction matters:
 Upgrading from no version marker at all (this mechanism's first-ever deploy) is
 handled operationally, not automatically -- scale to a single replica for that
 one transition.
+
+Version 3 (verdaccio-security-filter 1.3.0) stores each MAL advisory as its own
+entry in an item's `mals` list. Before it, a package flagged by two MAL
+advisories kept only the last one's range, so the versions the first one covered
+stopped being blocked. Deploying 1.3.0 runs one full re-bootstrap.
 
 ## MAL confidence filtering
 
@@ -499,7 +534,12 @@ client with no connection pool (nothing in this plugin does a blocking read,
 unlike some Redis use cases). `scanAll()` uses `SCAN`, not `KEYS`, to avoid
 blocking the server for the duration of a scan over a large keyspace. Bulk
 writes are pipelined in chunks for throughput at bootstrap scale; a pipeline
-failure fails every item in that chunk (all-or-nothing per chunk).
+failure fails every item in that chunk (all-or-nothing per chunk). `scanAll()`
+skips every key whose value isn't one of this plugin's items (JSON whose `pk`
+matches its own key), so a database shared with other applications, with
+`keyPrefix: ''` or otherwise, can't fail the warm start. ioredis 5 and 6 both
+work; ioredis 6 opens each connection with `HELLO 3` and falls back to the older
+protocol when the server refuses it.
 
 **Installing an optional backend's package**: `@aws-sdk/client-dynamodb`,
 `@aws-sdk/lib-dynamodb`, and `ioredis` are `peerDependencies`, not regular
@@ -523,6 +563,14 @@ the backend they actually chose.
   key, so its dist-tags are left alone.
 - If every remaining version is also blocked for a given tag, that tag is
   removed entirely rather than left dangling.
+- A version whose metadata isn't an object, or whose publish time is missing or
+  unparseable, is removed. A version that isn't valid semver is left alone, but
+  is never a `replace` substitute or a dist-tag redirect target.
+- A version the filter can't check (one of its checks throws) is removed and
+  logged at `error`. If the filter fails outside those per-version checks, it
+  removes every version the `allow:` list doesn't cover. Verdaccio would
+  otherwise serve the packument it handed the filter, unfiltered, and every
+  version the filter exists to hide with it.
 
 ## Publish-time gate
 
@@ -577,16 +625,49 @@ key: Verdaccio resolves a scoped plugin's config key verbatim, with no
 match and this shared lookup would silently fall back to each instance's own
 (much smaller) local config instead.
 
-**How it determines "new"**: on a `PUT` to the publish route, it parses the
-request body itself (this middleware runs before Verdaccio's own API router
-installs its `express.json()` body parser -- see `register_middlewares()`'s
-comments in `index.js` for exactly why re-parsing it here is safe and doesn't
-break Verdaccio's own subsequent handling of the same request), diffs `versions`
-in that body against the package's already-stored versions (via
-`storage.getPackage()`), and checks only the version keys that aren't already
-stored. This is robust to either shape npm sends (just the new version, or the
-full merged set) and naturally leaves `npm deprecate`/`npm star` requests
-untouched, since neither introduces a version key that isn't already stored.
+**Which requests**: every `PUT` that Verdaccio's publish route
+(`/:package/:_rev?/:revision?`) could take, when its body has a `versions`
+object. That includes `/:package/-rev/:revision`, which npm uses for deprecate
+and unpublish and which creates a version just as a fresh publish does.
+Verdaccio rewrites `/@scope/name` and `/%40scope/name` to `/@scope%2Fname` only
+after the plugin middlewares have run, so the gate applies the same rewrite
+first and checks the real package name. Verdaccio's own `/-/` endpoints and the
+tarball upload route are left alone.
+
+**Who is checked**: Verdaccio checks publish rights in its route, after every
+plugin middleware has run. The gate asks the same question first, through
+`auth.allow_publish()`. A caller who may not publish the package passes through
+untouched and gets Verdaccio's own 401 or 403. Only a caller who may publish
+ever causes a storage read, a tarball inspection or a webhook.
+
+**Request bodies**: the gate parses the body itself, with the body-parser 1.x
+`json()` Verdaccio uses and Verdaccio's own `max_body_size` limit (10mb by
+default). A body over the limit gets 413, malformed JSON gets 400, and a content
+type other than `application/json` isn't read at all. This happens before
+anything asynchronous, because Verdaccio's access log starts reading every
+request at once (verdaccio/verdaccio#1912). An asynchronous middleware
+registered ahead of this one has to pause the request itself, as
+`verdaccio-generic-oidc` and `verdaccio-oidc-auth` do. Verdaccio 6.10 parses the
+body before any plugin runs, and the gate then uses that parsed body. A
+`versions` entry that isn't an object gets 400.
+
+**How it determines "new"**: the gate diffs `versions` in the body against the
+versions already in local storage and checks only the keys that aren't there. It
+reads raw local metadata (`storage.localStorage.getPackageMetadata()`), not
+`storage.getPackage()`, which runs every filter first: a clean version still
+inside the `minDays` window would otherwise be missing from the baseline. A
+package never stored here takes its baseline from its uplink, through
+`storage.getPackage()`, because Verdaccio accepts a first local publish of a
+name its uplink already serves. This covers both shapes npm sends (just the new
+version, or the full merged set) and leaves `npm deprecate`/`npm star` alone,
+since neither adds a version.
+
+**When the check can't finish**: a storage read that fails answers 503, and an
+error inside the checks answers 500; neither lets the publish through. An uplink
+that can't be reached leaves no baseline, the same as for a name nobody has
+published, and is logged at `warn`. `register_middlewares()` refuses to start
+the gates on a Verdaccio without `auth.allow_publish()` or
+`storage.localStorage.getPackageMetadata()` (6.7.4 and 6.10.7 have both).
 
 ## Structural obfuscation heuristics
 
@@ -676,6 +757,21 @@ plugin see the tarball's own bytes (from the publish request's `_attachments`
 entry) -- `filter_metadata()`'s read-time equivalent only ever exercises the
 direct, command-text check.
 
+**The tarball**: the indirect check reads the publish's single attachment,
+whatever it is named, since that is the one Verdaccio stores. Paths on both
+sides are normalized the way npm resolves them, so `node ./scripts//setup.js`
+and `node scripts/../scripts/setup.js` both find `scripts/setup.js`. The check
+inflates at most 256MB, reads at most 100,000 entries and keeps at most 8MB of
+any referenced file. It refuses an attachment that is compressed twice, or is
+neither gzip nor tar.
+
+**A file the check can't read**: a referenced script that can't be inspected is
+a hit of its own kind. That covers a publish with no attachment, a tarball past
+a limit or unreadable, and a tarball that holds the file as a symbolic or hard
+link. With `block: true` it rejects the publish, naming the file and the reason;
+without it, it alerts. A referenced file that is simply absent from a readable
+tarball is not a hit.
+
 ## Audit / advisory endpoints
 
 Real `npm audit`/`yarn npm audit` support -- both the modern and legacy wire
@@ -723,6 +819,15 @@ dedicated compatibility testing against real npm/yarn/pnpm tooling first, to
 confirm it doesn't break existing install/audit flows; deferred until that
 testing happens.
 
+**Bounds**: anyone who can reach the registry can call these routes, so their
+work is bounded. advisories/bulk takes at most 1,000 versions per package and
+50,000 in all, and at most 200,000 version-against-advisory checks; past any of
+these it answers 413. audits(/quick) walks each `name@version` in the submitted
+graph once, however many paths reach it, and keeps at most 100 paths per
+finding. A graph with more than 250,000 edges, or one that needs more than
+200,000 checks, gets 413 rather than a report built from part of it: a partial
+report could tell a CI gate there is nothing to fix.
+
 **advisories/bulk** request/response is a flat `{name: [versions]}` in,
 `{name: [advisory, ...]}` out -- npm's own client-side
 `@npmcli/metavuln-calculator` `Advisory` class reads `id`/`severity` (defaults
@@ -765,11 +870,17 @@ remediation, on any major version.
 ## Webhooks
 
 A single, static, operator-configured webhook target -- fired for every "loud"
-(`error`-level, see "Logging" below) security event this plugin raises: the four
-publish-time gate rejections above, plus the OSV-sync retroactive alert
-described in "Malicious-package blocklist (OSV)". This is deliberately minimal
-compared to a full pub/sub notification system: one config-defined URL, no
-dynamic per-admin-created subscriptions, no SSRF surface to defend against --
+security event this plugin raises. The `event` field names it:
+`publish_blocked_cve`, `publish_blocked_mal`, `publish_blocked_rule`,
+`publish_blocked_script`, `publish_blocked_script_changed`,
+`publish_blocked_suspicious_script` and `publish_blocked_sensitive_path` for a
+rejected publish; `publish_suspicious_script` and `publish_sensitive_path` for
+one that was let through with an alert; `osv_retroactive_cve` and
+`osv_retroactive_mal` for the OSV-sync retroactive alert described in
+"Malicious-package blocklist (OSV)"; and `osv_sync_stale` and
+`osv_sync_recovered` for the sync alarm. This is deliberately minimal compared
+to a full pub/sub notification system: one config-defined URL, no dynamic
+per-admin-created subscriptions, no SSRF surface to defend against --
 `config.yaml` is the trust boundary here, same as `block:`/`allow:` above.
 
 ```yaml
@@ -803,8 +914,23 @@ publish-time gate's own 403 response body uses, or an equivalent one for the OSV
 retroactive alert); the four publish-time events also carry `user`; each event
 additionally carries whichever of `cveId`/`severity`/`cweIds`/`malIds`/
 `rule`/`scripts` apply to that specific reason (a manual `block:` match never
-carries `cveId`, for instance). See `webhook.js`'s call sites in `index.js`/
-`malicious-packages.js` for the exact field set per event.
+carries `cveId`, for instance). The sync alarm carries `event`, `reason`,
+`failures` and, for `osv_sync_stale`, `lastSuccessAt`. See `webhook.js`'s call
+sites in `index.js`/`malicious-packages.js` for the exact field set per event.
+
+**Escaping**: `pkg`, `ver`, `reason` and several other fields carry text a
+publisher chose. Every substituted value has its control characters removed. In
+`url` it is URL-encoded, so it can't add a path or a query parameter. In a
+`body` that is a JSON template (valid JSON once each placeholder stands for a
+string) it is JSON-escaped, so a Slack body like `{"text":"{{reason}}"}` stays
+one string field whatever the value holds. Header values only lose their control
+characters. The text inside the field is still the publisher's, and Slack reads
+its own markup there: a `<!channel>` in a version string notifies the channel.
+Only a caller allowed to publish the package can trigger a publish-time alert.
+
+**URLs and logs**: a delivery failure or an error response logs the URL's host,
+never the URL itself, since a Slack incoming-webhook URL is the credential. An
+`http:` URL sends that credential, and every alert, in clear text.
 
 **Delivery**: fire-and-forget. A failed delivery (network error, timeout,
 non-2xx/3xx response) logs a `warn` and is otherwise ignored -- it never
@@ -821,10 +947,9 @@ Every read-time block and dist-tag redirect logs a `warn`-level line
 (`security-filter: blocked -- ...` / `security-filter: dist-tag redirected ...`)
 including the package name, version, and reason -- these are the lines to grep
 for when a package unexpectedly fails to resolve to the version you expect. OSV
-sync progress (bootstrap completion, a newly-applied or withdrawn advisory) also
-logs at `warn`; a `304`/nothing-changed poll cycle logs nothing at all, since
-it's the expected common case every poll interval and would otherwise be pure
-noise.
+sync progress (bootstrap completion, a newly-applied or withdrawn advisory) logs
+at `info`; a `304`/nothing-changed poll cycle logs nothing at all, since it's
+the expected common case every poll interval and would otherwise be pure noise.
 
 A publish-time rejection is deliberately louder: it logs at **`fatal`** (not
 `warn`) with a `security-filter: !!! BLOCKED PUBLISH !!! ...` line, including
@@ -832,9 +957,10 @@ the package, version, publishing user, and either the offending script
 command(s) or the matched OSV advisory id(s)/block rule, for immediate forensic
 value. This is an active attempt happening right now, not a passive wait-it-out
 decision, so it's treated as a noteworthy failure rather than a normal
-blocked/rejected/redirected one. Any OSV fetch or storage-backend failure during
-sync also logs at `error`, for the ordinary reason: it's an unexpected failure,
-not an active-attempt exception.
+blocked/rejected/redirected one. An OSV fetch or storage-backend failure during
+sync logs at `warn` (a whole cycle that will be retried) or `error` (a record or
+a write that failed), and the stale alarm (see "Malicious-package blocklist
+(OSV)") at `error`.
 
 The OSV-sync retroactive alert (see "Malicious-package blocklist (OSV)") is
 equally loud, at `fatal` with a
@@ -850,18 +976,18 @@ configured `webhook:` (see "Webhooks" above), if any.
 ranges, stable/prerelease detection, and sorting redirect/replace candidates.
 `minimatch` -- `block:`/`allow:` pattern matching, the same convention Verdaccio
 core (and every other plugin in this family) uses for package-name matching.
-`body-parser` -- used only by the publish-time gates, to parse the request body
-ahead of Verdaccio's own parsing; unused when `blockPublishWithNewScripts`,
-`blockPublishMatches`, and `sensitivePaths.enabled` are all left at their
-default `false`. `yauzl` -- streams the OSV bootstrap zip without holding the
-whole archive decompressed in memory at once. `tar` -- used only by
+`body-parser` (1.x, the major Verdaccio's own express bundles: 1.x and 2.x don't
+chain on one request) -- parses the audit endpoints' bodies and, for the
+publish-time gates, the publish body ahead of Verdaccio's own parsing, under the
+same `max_body_size` limit. `yauzl` -- streams the OSV bootstrap zip without
+holding the whole archive decompressed in memory at once. `tar` -- used only by
 `sensitivePaths`' indirect check, to read specific entries back out of a
-publish's own tarball attachment (gzip auto-detected; nothing else in this
-plugin ever touches tarball bytes). `ae-cvss-calculator` -- computes CVSS
-v3.1/v4.0 base scores for `osv.cve.cvss3Min`/`cvss4Min` (see "CVE (GHSA)
-blocking" above); a regular dependency, not an optional peer, since CVE data
-(including scores) is always computed at sync time whenever `osv.enabled: true`,
-the same as severity/CWE.
+publish's own tarball attachment; gzip is inflated with `node:zlib` first so the
+inflated size can be counted, and nothing else in this plugin ever touches
+tarball bytes. `ae-cvss-calculator` -- computes CVSS v3.1/v4.0 base scores for
+`osv.cve.cvss3Min`/`cvss4Min` (see "CVE (GHSA) blocking" above); a regular
+dependency, not an optional peer, since CVE data (including scores) is always
+computed at sync time whenever `osv.enabled: true`, the same as severity/CWE.
 
 `@aws-sdk/client-dynamodb`, `@aws-sdk/lib-dynamodb`, and `ioredis` are
 **optional peer dependencies** (see [Storage backends](#storage-backends)

@@ -35,6 +35,10 @@ const KNOWN_SEVERITIES = new Set([
 // practice, it's just a backstop.
 const MAX_DEPTH = 40;
 
+// Paths kept per (package, advisory) finding. The count of findings is
+// what reporters show; past this many, more paths add nothing to read.
+const MAX_PATHS_PER_FINDING = 100;
+
 // Shared with advisories/bulk's response shape (id/title/url/severity/
 // vulnerable_versions/cwe/cvss) -- see its own comment for why those fields
 // are built the way they are. module_name/patched_versions/findings are
@@ -99,41 +103,73 @@ function resolveInChain(scopeChain, name) {
 }
 
 // Walks the submitted tree/graph from every top-level dependency, recording
-// every (package, version, path) occurrence actually reachable -- then
-// checks each one against the real CVE store (getCveAdvisories, same
-// source advisories/bulk uses -- both require the occurrence's own actual
-// version(s) and filter by them, so neither can report a CVE whose
-// vulnerableVersions range doesn't actually cover what's installed) exactly
-// the way a real install would.
+// (package, version, path) occurrences -- then checks each one against the
+// real CVE store (getCveAdvisories, same source advisories/bulk uses -- both
+// require the occurrence's own actual version(s) and filter by them, so
+// neither can report a CVE whose vulnerableVersions range doesn't actually
+// cover what's installed) exactly the way a real install would.
+//
+// Each (name, version) node has its own requires walked once, however many
+// paths reach it: a graph where every package requires every other has a
+// number of distinct paths exponential in its size, and enumerating them
+// is how a 2 KB request used to occupy the event loop for seconds. Every
+// edge into a node still records an occurrence (up to
+// MAX_PATHS_PER_FINDING per finding), so reporters see each place a
+// vulnerable package is required from. `maxVisits` caps the edges walked;
+// past it the walk throws AUDIT_VISIT_BUDGET rather than return a report
+// built from part of the graph.
 function findVulnerableOccurrences(
   dependencies,
   topLevelNames,
   maliciousPackageStore,
+  {maxVisits = Infinity, budget} = {},
 ) {
   const hitsByPackage = new Map(); // name -> Map(cveId -> {cve, occurrences: [{version, path, dev}]})
-  const visitedPaths = new Set(); // bounds revisits on graphs with shared subtrees
+  const walked = new Set(); // name@version nodes whose requires were already walked
+  const cvesByNode = new Map(); // name@version -> advisories, looked up once
+  let visits = 0;
 
   function recordHit(name, version, dev, path) {
-    const cves = maliciousPackageStore?.getCveAdvisories(name, [version]) ?? [];
+    const node = `${name}@${version}`;
+    let cves = cvesByNode.get(node);
+    if (cves === undefined) {
+      cves =
+        maliciousPackageStore?.getCveAdvisories(name, [version], budget) ?? [];
+      cvesByNode.set(node, cves);
+    }
     for (const cve of cves) {
       if (!hitsByPackage.has(name)) hitsByPackage.set(name, new Map());
       const byCve = hitsByPackage.get(name);
       if (!byCve.has(cve.id)) byCve.set(cve.id, {cve, occurrences: []});
-      byCve.get(cve.id).occurrences.push({version, dev, path});
+      const {occurrences} = byCve.get(cve.id);
+      if (occurrences.length < MAX_PATHS_PER_FINDING) {
+        occurrences.push({version, dev, path});
+      }
     }
   }
 
   function visit(name, ancestorNames, scopeChain) {
+    visits += 1;
+    if (visits > maxVisits) {
+      throw Object.assign(
+        new Error(`audit graph walk passed ${maxVisits} edges`),
+        {code: 'AUDIT_VISIT_BUDGET'},
+      );
+    }
     const info = resolveInChain(scopeChain, name);
     if (!info || typeof info !== 'object') return;
 
+    const version = typeof info.version === 'string' ? info.version : null;
     const path = [...ancestorNames, name].join('>');
-    if (visitedPaths.has(path)) return;
-    visitedPaths.add(path);
+    if (version) recordHit(name, version, !!info.dev, path);
 
-    if (info.version) recordHit(name, info.version, !!info.dev, path);
-
+    // A node reached at the depth cap isn't marked walked: a shorter path
+    // may reach it later, and that one walks its requires.
     if (ancestorNames.length >= MAX_DEPTH) return;
+    const node = `${name}@${version ?? ''}`;
+    if (walked.has(node)) return;
+    walked.add(node);
+
     const requires =
       info.requires && typeof info.requires === 'object' ? info.requires : null;
     if (!requires) return;
@@ -163,7 +199,7 @@ function findVulnerableOccurrences(
 // Every action is 'review', never 'update'/'install': see
 // buildLegacyAdvisory()'s patched_versions comment for why there's no
 // upgrade target to recommend automatically.
-function buildLegacyAuditReport(body, maliciousPackageStore) {
+function buildLegacyAuditReport(body, maliciousPackageStore, limits) {
   const dependencies =
     body?.dependencies && typeof body.dependencies === 'object'
       ? body.dependencies
@@ -186,6 +222,7 @@ function buildLegacyAuditReport(body, maliciousPackageStore) {
     dependencies,
     topLevelNames,
     maliciousPackageStore,
+    limits,
   );
 
   const advisories = {};

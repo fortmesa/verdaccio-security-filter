@@ -25,7 +25,10 @@ const CVE_ID_PREFIX = 'GHSA-';
 // compares this against what's stored in SYNC_STATE_KEY at warm-start and
 // forces a full re-bootstrap on any mismatch, rather than waiting for each
 // individual advisory to happen to receive a fresh OSV-side update.
-const EXTRACTION_SCHEMA_VERSION = 2;
+//
+// 3: MAL advisories are stored per advisory (an item's `mals` list) instead
+// of one advisory's fields overwriting the last's.
+const EXTRACTION_SCHEMA_VERSION = 3;
 
 function isMalRecord(id) {
   return typeof id === 'string' && id.startsWith(MAL_ID_PREFIX);
@@ -274,11 +277,60 @@ function extractMinimalRecord(raw) {
   return null;
 }
 
-async function fetchWithTimeout(url, options, timeoutMs) {
+// Byte limits on what one fetch may return. all.zip's limit is
+// configurable (osv.maxDownloadMB, 219MB on 2026-10-24); the CSV was about
+// 9MB and a single record a few KB at the same date.
+const MAX_CSV_BYTES = 64 * 1024 * 1024;
+const MAX_RECORD_BYTES = 16 * 1024 * 1024;
+
+// Fetches `url` and reads the whole body under one abort signal. The
+// timeout is a stall timeout: it is re-armed every time bytes arrive, so a
+// slow but moving download of all.zip finishes, and a connection that goes
+// quiet anywhere, before the headers or in the middle of the body, fails
+// instead of holding the sync loop forever. A body past `maxBytes` fails
+// too. Returns {res, body}; body is null for a 304 or a non-2xx response.
+async function fetchBody(url, {headers, timeoutMs, maxBytes, what}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timer;
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(
+      () =>
+        controller.abort(
+          new Error(`osv: ${what} stalled for ${timeoutMs}ms, aborted`),
+        ),
+      timeoutMs,
+    );
+  };
+  arm();
   try {
-    return await fetch(url, {...options, signal: controller.signal});
+    const res = await fetch(url, {headers, signal: controller.signal});
+    if (res.status === 304 || !res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return {res, body: null};
+    }
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(
+        `osv: ${what} is ${declared} bytes, over the ${maxBytes}-byte limit`,
+      );
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of res.body ?? []) {
+      arm();
+      size += chunk.length;
+      if (size > maxBytes) {
+        throw new Error(`osv: ${what} passed the ${maxBytes}-byte limit`);
+      }
+      chunks.push(chunk);
+    }
+    return {res, body: Buffer.concat(chunks)};
+  } catch (err) {
+    throw controller.signal.aborted && controller.signal.reason instanceof Error
+      ? controller.signal.reason
+      : err;
   } finally {
     clearTimeout(timer);
   }
@@ -335,19 +387,24 @@ function nextZipEntry(zipfile) {
   });
 }
 
-// Downloads npm/all.zip in full (a one-time, per-bootstrap cost) and yields
+// Downloads npm/all.zip in full (a one-time, per-bootstrap cost, bounded by
+// maxBytes) and yields
 // one minimal record at a time. Only one full raw OSV record is ever parsed
 // into memory at once -- it's extracted down to ~100 bytes and discarded
 // before the next entry is read, regardless of how large the zip is overall.
-async function* fetchAllRecords({baseUrl, timeoutMs, logger}) {
-  const res = await fetchWithTimeout(
-    new URL('all.zip', baseUrl),
-    {},
+async function* fetchAllRecords({
+  baseUrl,
+  timeoutMs,
+  maxBytes = 512 * 1024 * 1024,
+  logger,
+}) {
+  const {res, body: buf} = await fetchBody(new URL('all.zip', baseUrl), {
     timeoutMs,
-  );
+    maxBytes,
+    what: 'all.zip',
+  });
   if (!res.ok)
     throw new Error(`osv: fetching all.zip failed: HTTP ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
 
   const zipfile = await new Promise((resolve, reject) => {
     yauzl.fromBuffer(buf, {lazyEntries: true}, (err, zf) =>
@@ -398,16 +455,17 @@ async function fetchModifiedCsv({
   if (etag) headers['If-None-Match'] = etag;
   if (lastModified) headers['If-Modified-Since'] = lastModified;
 
-  const res = await fetchWithTimeout(
-    new URL('modified_id.csv', baseUrl),
-    {headers},
+  const {res, body} = await fetchBody(new URL('modified_id.csv', baseUrl), {
+    headers,
     timeoutMs,
-  );
+    maxBytes: MAX_CSV_BYTES,
+    what: 'modified_id.csv',
+  });
   if (res.status === 304) return {notModified: true};
   if (!res.ok)
     throw new Error(`osv: fetching modified_id.csv failed: HTTP ${res.status}`);
 
-  const text = await res.text();
+  const text = body.toString('utf8');
   const rows = [];
   for (const line of text.split('\n')) {
     const trimmed = line.trim();
@@ -431,14 +489,14 @@ async function fetchModifiedCsv({
 
 // Fetches and extracts a single changed/new record by id (npm/<ID>.json).
 async function fetchRecord(id, {baseUrl, timeoutMs}) {
-  const res = await fetchWithTimeout(
-    new URL(`${id}.json`, baseUrl),
-    {},
+  const {res, body} = await fetchBody(new URL(`${id}.json`, baseUrl), {
     timeoutMs,
-  );
+    maxBytes: MAX_RECORD_BYTES,
+    what: `${id}.json`,
+  });
   if (!res.ok)
     throw new Error(`osv: fetching ${id}.json failed: HTTP ${res.status}`);
-  return extractMinimalRecord(await res.json());
+  return extractMinimalRecord(JSON.parse(body.toString('utf8')));
 }
 
 module.exports = {

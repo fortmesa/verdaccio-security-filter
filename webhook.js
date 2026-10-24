@@ -13,16 +13,46 @@
 //     any-other-key: value        # sent as an HTTP header, verbatim key
 // `url`, `body`, and every header value are template strings: `{{name}}`
 // is replaced with the matching field from the event data object.
+//
+// Several fields (pkg, ver, reason, ...) carry text a publisher chose, so
+// every substituted value has its control characters removed, and is then
+// encoded for where it lands: URL-encoded in `url`, JSON-escaped in a
+// `body` that is a JSON template (a `{"text":"{{reason}}"}` Slack body
+// stays one string field whatever the value holds), and left as is in a
+// header (Node itself refuses a header value with CR or LF in it).
 
 const http = require('node:http');
 const https = require('node:https');
 
 const RESERVED_KEYS = new Set(['url', 'body']);
+const PLACEHOLDER = /\{\{(\w+)\}\}/g;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/g;
 
-function substitute(template, data) {
-  return String(template).replace(/\{\{(\w+)\}\}/g, (_match, key) =>
-    data[key] === undefined || data[key] === null ? '' : String(data[key]),
+function fieldText(data, key) {
+  const value = data[key];
+  if (value === undefined || value === null) return '';
+  return String(value).replace(CONTROL_CHARS, '');
+}
+
+function substitute(template, data, encode = text => text) {
+  return String(template).replace(PLACEHOLDER, (_match, key) =>
+    encode(fieldText(data, key)),
   );
+}
+
+// A body template that is valid JSON once every placeholder stands for an
+// ordinary string. Placeholders are then filled with JSON-escaped text.
+function isJsonTemplate(template) {
+  try {
+    JSON.parse(String(template).replace(PLACEHOLDER, 'x'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function jsonEscape(text) {
+  return JSON.stringify(text).slice(1, -1);
 }
 
 // Fire-and-forget: never throws, never blocks the caller on network I/O.
@@ -33,7 +63,7 @@ function sendWebhook(webhookConfig, data, logger) {
 
   let url;
   try {
-    url = new URL(substitute(webhookConfig.url, data));
+    url = new URL(substitute(webhookConfig.url, data, encodeURIComponent));
   } catch (err) {
     logger?.error(
       {err: err.message},
@@ -43,7 +73,7 @@ function sendWebhook(webhookConfig, data, logger) {
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     logger?.error(
-      {url: url.toString()},
+      {protocol: url.protocol, host: url.host},
       'security-filter: webhook -- unsupported url protocol, skipped',
     );
     return;
@@ -51,7 +81,11 @@ function sendWebhook(webhookConfig, data, logger) {
 
   const body =
     webhookConfig.body !== undefined
-      ? substitute(webhookConfig.body, data)
+      ? substitute(
+          webhookConfig.body,
+          data,
+          isJsonTemplate(webhookConfig.body) ? jsonEscape : undefined,
+        )
       : undefined;
 
   const headers = {};
@@ -82,7 +116,7 @@ function sendWebhook(webhookConfig, data, logger) {
         res.resume(); // drain and discard -- nothing downstream reads the response
         if (res.statusCode >= 400) {
           logger?.warn(
-            {url: url.toString(), status: res.statusCode},
+            {host: url.host, status: res.statusCode},
             'security-filter: webhook -- delivery got a non-2xx/3xx response (@{status})',
           );
         }
@@ -98,7 +132,7 @@ function sendWebhook(webhookConfig, data, logger) {
   req.on('timeout', () => req.destroy(new Error('webhook request timed out')));
   req.on('error', err => {
     logger?.warn(
-      {err: err.message, url: url.toString()},
+      {err: err.message, host: url.host},
       'security-filter: webhook -- delivery failed, ignored',
     );
   });

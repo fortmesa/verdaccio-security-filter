@@ -42,6 +42,11 @@ function makeFakeStorage() {
     getPackage({callback}) {
       callback({status: 404}, null);
     },
+    localStorage: {
+      getPackageMetadata(name, callback) {
+        callback({status: 404, code: 404}, null);
+      },
+    },
   };
 }
 
@@ -51,12 +56,28 @@ function makeFakeStorage() {
 // on. Duplicated rather than imported -- this repo's smoke tests are each
 // self-contained (see test/smoke-legacy-audit.js, test/smoke-malicious-
 // packages.js), not sharing a test-utils module.
+// Stands in for Verdaccio's Auth#allow_publish: every request here comes
+// from a user allowed to publish (see test/smoke.js for the refusal paths).
+const ALLOW_ALL_AUTH = {
+  allow_publish(pkg, user, callback) {
+    callback(null, true);
+  },
+};
+const PUBLISHER = {name: 'tester', groups: ['$all', '$authenticated']};
+
+// register_middlewares() registers several app.use() handlers; this
+// dispatches through all of them in order, as Express would.
 async function startServer(instance, storage) {
-  let handler;
-  instance.register_middlewares({use: fn => (handler = fn)}, null, storage);
+  const handlers = [];
+  instance.register_middlewares(
+    {use: fn => handlers.push(fn)},
+    ALLOW_ALL_AUTH,
+    storage,
+  );
 
   const server = http.createServer((req, res) => {
     req.path = new URL(req.url, 'http://localhost').pathname;
+    req.remote_user = PUBLISHER;
     res.status = function (code) {
       this.statusCode = code;
       return this;
@@ -65,16 +86,21 @@ async function startServer(instance, storage) {
       this.setHeader('content-type', 'application/json');
       this.end(JSON.stringify(body));
     };
+    let index = 0;
     const next = err => {
       if (res.headersSent) return;
       if (err) {
         res.status(err.status || 500).json({error: err.message});
         return;
       }
-      res.status(201).json({ok: true});
+      const handler = handlers[index++];
+      if (!handler) {
+        res.status(201).json({ok: true});
+        return;
+      }
+      handler(req, res, next);
     };
-    if (!handler) return next();
-    handler(req, res, next);
+    next();
   });
 
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));

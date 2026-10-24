@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const yazl = require('yazl');
+const zlib = require('node:zlib');
 const {
   ScanCommand,
   GetCommand,
@@ -44,19 +44,33 @@ function makeCapturingLogger() {
   };
 }
 
-// Minimal Storage#getPackage stand-in -- same shape test/smoke.js and
+// Minimal Storage stand-in -- same shape test/smoke.js and
 // test/smoke-webhook.js use, just under the name this file's own tests
-// reach for.
+// reach for. The retroactive check reads raw local metadata through
+// localStorage.getPackageMetadata(); getPackage() is Verdaccio's filtered
+// read, and `filteredView` gives it a different answer to prove the check
+// never uses it.
 function makeFakeRegistryStorage() {
   const existingByName = new Map();
+  const filteredByName = new Map();
   return {
     setExisting(name, versions) {
       existingByName.set(name, {versions});
     },
+    filteredView(name, versions) {
+      filteredByName.set(name, {versions});
+    },
     getPackage({name, callback}) {
-      const existing = existingByName.get(name);
+      const existing = filteredByName.get(name) ?? existingByName.get(name);
       if (!existing) return callback({status: 404}, null);
       callback(null, existing);
+    },
+    localStorage: {
+      getPackageMetadata(name, callback) {
+        const existing = existingByName.get(name);
+        if (!existing) return callback({status: 404, code: 404}, null);
+        callback(null, existing);
+      },
     },
   };
 }
@@ -197,26 +211,47 @@ function makeGhsaRecord({
   };
 }
 
+// Writes a zip of stored (uncompressed) entries, which is all the fixture
+// feed needs: local headers, a central directory and its end record, with
+// zlib.crc32 for the checksums.
 function buildZip(records) {
-  return new Promise((resolve, reject) => {
-    const zipfile = new yazl.ZipFile();
-    for (const record of records) {
-      zipfile.addBuffer(
-        Buffer.from(JSON.stringify(record)),
-        `npm/${record.id}.json`,
-      );
-    }
-    const chunks = [];
-    zipfile.outputStream.on('data', c => chunks.push(c));
-    zipfile.outputStream.on('end', () => resolve(Buffer.concat(chunks)));
-    zipfile.outputStream.on('error', reject);
-    zipfile.end();
-  });
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const record of records) {
+    const name = Buffer.from(`npm/${record.id}.json`);
+    const data = Buffer.from(JSON.stringify(record));
+    const crc = zlib.crc32(data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4); // version needed
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4); // version made by
+    central.writeUInt16LE(20, 6); // version needed
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt32LE(offset, 42);
+    locals.push(local, name, data);
+    centrals.push(central, name);
+    offset += local.length + name.length + data.length;
+  }
+  const directory = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(records.length, 8);
+  end.writeUInt16LE(records.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Promise.resolve(Buffer.concat([...locals, directory, end]));
 }
 
-// A real local HTTP server standing in for OSV's endpoints, with
-// controllable fixture content and real conditional-GET (ETag) handling so
-// tests can assert on both the 200 and 304 branches concretely.
 async function startMockOsvServer() {
   let zipBuffer = Buffer.alloc(0);
   let csvRows = []; // [{modified, id}], newest-first, matching the real feed's order
@@ -498,15 +533,19 @@ async function main() {
 
         const stored = client.table.get('evil-one');
         assert.deepEqual(Object.keys(stored).sort(), [
-          'malIds',
+          'mals',
           'modified',
-          'originCount',
           'pk',
+        ]);
+        assert.equal(stored.mals.length, 1);
+        assert.deepEqual(Object.keys(stored.mals[0]).sort(), [
+          'id',
+          'originCount',
           'sources',
           'vulnerableVersions',
         ]);
         assert.equal(
-          stored.vulnerableVersions,
+          stored.mals[0].vulnerableVersions,
           '*',
           'a whole-package block (introduced: "0", no fixed/lastAffected) is the "*" range',
         );
@@ -563,6 +602,9 @@ async function main() {
 
         const store = makeStore({baseUrl: osv.baseUrl}, client);
         await bootstrapStore(store); // completes bootstrap, which does touch DynamoDB
+        // Bootstrap stores no CSV etag (its watermark is the zip's own), so
+        // the first incremental cycle reads the CSV in full and records it.
+        await store.runSyncCycle();
 
         const callsAfterBootstrap = client.callCount();
         await store.runSyncCycle(); // steady-state now; CSV etag hasn't changed
@@ -1354,7 +1396,7 @@ async function main() {
 
         const stored = client.table.get('dual-pkg');
         assert.ok(
-          stored.malIds,
+          stored.mals?.length,
           'MAL fields must survive being merged with the GHSA record',
         );
         assert.equal(
@@ -1407,7 +1449,7 @@ async function main() {
 
         const stored = client.table.get('incremental-pkg');
         assert.ok(
-          stored.malIds,
+          stored.mals?.length,
           'the earlier MAL fields must survive an incremental CVE-only update',
         );
         assert.equal(
@@ -1449,7 +1491,7 @@ async function main() {
         );
         await bootstrapStore(store);
         assert.ok(client.table.get('mixed-pkg').cves);
-        assert.ok(client.table.get('mixed-pkg').malIds);
+        assert.ok(client.table.get('mixed-pkg').mals?.length);
 
         osv.setCsvEtag('etag-v2');
         osv.setCsvRows([
@@ -1473,7 +1515,7 @@ async function main() {
           'the withdrawn CVE entry should be removed',
         );
         assert.ok(
-          stored.malIds,
+          stored.mals?.length,
           'the MAL dimension should be untouched by a CVE withdrawal',
         );
         assert.ok(
@@ -1898,6 +1940,427 @@ async function main() {
 
       await store.deleteItem('left-pad');
       assert.ok(!client.table.has('osv-left-pad'));
+    },
+  );
+
+  // --- per-advisory MAL entries, bootstrap watermark and write retries ---
+
+  await check(
+    'two MAL advisories for one package each keep their own range; an update or withdrawal of one leaves the other',
+    async () => {
+      const osv = await startMockOsvServer();
+      const client = makeFakeDynamoClient();
+      try {
+        await osv.setFixtureRecords([
+          makeOsvRecord({
+            id: 'MAL-A',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'twice',
+            introduced: '1.0.0',
+            fixed: '2.0.0',
+          }),
+          makeOsvRecord({
+            id: 'MAL-B',
+            modified: '2025-01-02T00:00:00Z',
+            packageName: 'twice',
+            introduced: '3.0.0',
+            fixed: '4.0.0',
+          }),
+        ]);
+        osv.setCsvRows([]);
+        const store = makeStore({baseUrl: osv.baseUrl}, client);
+        await bootstrapStore(store);
+
+        assert.deepEqual(store.check('twice', '1.5.0')?.malIds, ['MAL-A']);
+        assert.deepEqual(store.check('twice', '3.5.0')?.malIds, ['MAL-B']);
+        assert.equal(client.table.get('twice').mals.length, 2);
+
+        // MAL-A narrows its range; MAL-B must still hold.
+        osv.setCsvEtag('etag-v2');
+        osv.setCsvRows([{modified: '2030-01-01T00:00:00Z', id: 'MAL-A'}]);
+        osv.setRecord(
+          'MAL-A',
+          makeOsvRecord({
+            id: 'MAL-A',
+            modified: '2030-01-01T00:00:00Z',
+            packageName: 'twice',
+            introduced: '1.0.0',
+            fixed: '1.2.0',
+          }),
+        );
+        await store.runSyncCycle();
+        assert.equal(store.check('twice', '1.5.0'), null);
+        assert.deepEqual(store.check('twice', '1.1.0')?.malIds, ['MAL-A']);
+        assert.deepEqual(store.check('twice', '3.5.0')?.malIds, ['MAL-B']);
+
+        // Withdrawing MAL-B leaves MAL-A.
+        osv.setCsvEtag('etag-v3');
+        osv.setCsvRows([{modified: '2030-02-01T00:00:00Z', id: 'MAL-B'}]);
+        osv.setRecord(
+          'MAL-B',
+          makeOsvRecord({
+            id: 'MAL-B',
+            modified: '2030-02-01T00:00:00Z',
+            packageName: 'twice',
+            withdrawn: true,
+          }),
+        );
+        await store.runSyncCycle();
+        assert.equal(store.check('twice', '3.5.0'), null);
+        assert.deepEqual(store.check('twice', '1.1.0')?.malIds, ['MAL-A']);
+        assert.deepEqual(
+          client.table.get('twice').mals.map(mal => mal.id),
+          ['MAL-A'],
+        );
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    "bootstrap's watermark is the zip's newest record, so a CSV row newer than the zip is fetched by the next cycle",
+    async () => {
+      const osv = await startMockOsvServer();
+      const client = makeFakeDynamoClient();
+      try {
+        await osv.setFixtureRecords([
+          makeOsvRecord({
+            id: 'MAL-OLD',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'old-pkg',
+          }),
+        ]);
+        // The CSV is a newer snapshot than the zip: it already lists a
+        // record the zip doesn't carry.
+        osv.setCsvRows([
+          {modified: '2026-01-01T00:00:00Z', id: 'MAL-GAP'},
+          {modified: '2025-01-01T00:00:00Z', id: 'MAL-OLD'},
+        ]);
+        osv.setRecord(
+          'MAL-GAP',
+          makeOsvRecord({
+            id: 'MAL-GAP',
+            modified: '2026-01-01T00:00:00Z',
+            packageName: 'gap-pkg',
+          }),
+        );
+        const store = makeStore({baseUrl: osv.baseUrl}, client);
+        await bootstrapStore(store);
+        assert.equal(store._lastSyncedModifiedId, '2025-01-01T00:00:00Z');
+        assert.equal(store.check('gap-pkg', '1.0.0'), null);
+
+        await store.runSyncCycle();
+        assert.ok(store.check('gap-pkg', '1.0.0'), 'the gap record is applied');
+        assert.equal(store._lastSyncedModifiedId, '2026-01-01T00:00:00Z');
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'bootstrap is not complete while the store refused items: they are enforced in memory and retried alone next cycle',
+    async () => {
+      const osv = await startMockOsvServer();
+      const inner = makeFakeDynamoClient();
+      let refuseBatches = true;
+      const client = {
+        table: inner.table,
+        async send(command) {
+          if (refuseBatches && command instanceof BatchWriteCommand) {
+            throw new Error('simulated BatchWriteCommand failure');
+          }
+          return inner.send(command);
+        },
+      };
+      try {
+        await osv.setFixtureRecords([
+          makeOsvRecord({
+            id: 'MAL-2025-50',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'refused-pkg',
+          }),
+        ]);
+        osv.setCsvRows([]);
+        const store = makeStore({baseUrl: osv.baseUrl}, client);
+        await store.ready;
+        assert.equal(await store.runSyncCycle(), false);
+        assert.equal(store._bootstrapCompletedAt, null);
+        assert.ok(store.check('refused-pkg', '1.0.0'), 'enforced in memory');
+        assert.equal(client.table.has('refused-pkg'), false);
+        assert.equal(client.table.has('__sync_state__'), false);
+
+        refuseBatches = false;
+        const requestsBefore = osv.requestCount();
+        assert.equal(await store.runSyncCycle(), true);
+        assert.equal(osv.requestCount(), requestsBefore, 'no second download');
+        assert.ok(client.table.has('refused-pkg'));
+        assert.ok(client.table.get('__sync_state__').bootstrapCompletedAt);
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  // --- failure handling: backoff, staleness alarm, warm-start retry ---
+
+  function makeFlakyClient() {
+    const inner = makeFakeDynamoClient();
+    const client = {
+      table: inner.table,
+      down: true,
+      async send(command) {
+        if (client.down) throw new Error('store unreachable');
+        return inner.send(command);
+      },
+    };
+    return client;
+  }
+
+  await check(
+    'a store that cannot be reached is retried on a backoff, not in a tight loop',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([]);
+        osv.setCsvRows([]);
+        const store = makeStore(
+          {baseUrl: osv.baseUrl, pollJitter: 0},
+          makeFlakyClient(),
+        );
+        await store.ready; // the warm start fails: failure 1
+        assert.equal(store._nextDelayMs(), 30000);
+        await store._tick();
+        assert.equal(store._nextDelayMs(), 60000);
+        await store._tick();
+        assert.equal(store._nextDelayMs(), 120000);
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'after staleAfterCycles failed cycles the sync raises one alarm (log and webhook), and reports recovery',
+    async () => {
+      const osv = await startMockOsvServer();
+      const receiver = await startWebhookReceiver();
+      try {
+        await osv.setFixtureRecords([]);
+        osv.setCsvRows([]);
+        const client = makeFlakyClient();
+        const logger = makeCapturingLogger();
+        const store = makeStore(
+          {baseUrl: osv.baseUrl, staleAfterCycles: 3},
+          client,
+          {
+            logger,
+            webhookConfig: {
+              url: `${receiver.url}/alert`,
+              body: '{"event":"{{event}}","failures":"{{failures}}"}',
+            },
+          },
+        );
+        await store.ready; // 1
+        await store._tick(); // 2
+        await store._tick(); // 3 -- the alarm
+        await store._tick(); // 4 -- no second alarm
+        await waitFor(() => receiver.requests.length >= 1);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        assert.equal(receiver.requests.length, 1);
+        assert.deepEqual(JSON.parse(receiver.requests[0].body), {
+          event: 'osv_sync_stale',
+          failures: '3',
+        });
+        assert.ok(
+          logger.calls.error.some(([, message]) => /going stale/.test(message)),
+        );
+
+        client.down = false;
+        await store._tick();
+        await waitFor(() => receiver.requests.length >= 2);
+        assert.equal(
+          JSON.parse(receiver.requests[1].body).event,
+          'osv_sync_recovered',
+        );
+        assert.equal(store._consecutiveFailures, 0);
+      } finally {
+        osv.server.close();
+        await receiver.close();
+      }
+    },
+  );
+
+  await check(
+    'a warm start that failed at startup is retried by the next cycle, before any re-bootstrap',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([]);
+        osv.setCsvRows([]);
+        const client = makeFlakyClient();
+        client.table.set('__sync_state__', {
+          pk: '__sync_state__',
+          extractionSchemaVersion: osvClient.EXTRACTION_SCHEMA_VERSION,
+          bootstrapCompletedAt: '2025-01-01T00:00:00Z',
+          lastSyncedModifiedId: '2025-01-01T00:00:00Z',
+          csvEtag: 'etag-v1',
+        });
+        client.table.set('stored-pkg', {
+          pk: 'stored-pkg',
+          mals: [
+            {id: 'MAL-1', vulnerableVersions: '*', originCount: 1, sources: []},
+          ],
+        });
+        const store = makeStore({baseUrl: osv.baseUrl}, client);
+        await store.ready; // fails: store down
+        assert.equal(store.check('stored-pkg', '1.0.0'), null);
+
+        client.down = false;
+        assert.equal(await store.runSyncCycle(), true);
+        assert.ok(
+          store.check('stored-pkg', '1.0.0'),
+          'loaded by the retried warm start',
+        );
+        assert.ok(store._bootstrapCompletedAt, 'no re-bootstrap needed');
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'an OSV download that stalls fails within the stall timeout, and one past its byte limit fails too',
+    async () => {
+      const server = http.createServer((req, res) => {
+        if (req.url.endsWith('modified_id.csv')) {
+          res.writeHead(200, {'content-type': 'text/csv'});
+          res.write('2030-01-01T00:00:00Z,MAL-1\n'); // then nothing more, ever
+          return;
+        }
+        if (req.url.endsWith('all.zip') && req.headers['x-chunked']) {
+          res.writeHead(200);
+          res.end(Buffer.alloc(5000));
+          return;
+        }
+        res.writeHead(200, {'content-length': '5000'});
+        res.end(Buffer.alloc(5000));
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      const baseUrl = `http://127.0.0.1:${server.address().port}/npm/`;
+      // A fetch that never settles fails here after 3s, instead of hanging
+      // the run.
+      const within3s = promise =>
+        Promise.race([
+          promise,
+          new Promise((resolve, reject) =>
+            setTimeout(
+              () => reject(new Error('still waiting after 3s')),
+              3000,
+            ).unref(),
+          ),
+        ]);
+      try {
+        await assert.rejects(
+          within3s(osvClient.fetchModifiedCsv({baseUrl, timeoutMs: 200})),
+          /stalled for 200ms/,
+        );
+
+        const drain = async iterator => {
+          for await (const record of iterator) void record;
+        };
+        await assert.rejects(
+          within3s(
+            drain(
+              osvClient.fetchAllRecords({
+                baseUrl,
+                timeoutMs: 1000,
+                maxBytes: 1000,
+              }),
+            ),
+          ),
+          /over the 1000-byte limit/,
+        );
+      } finally {
+        server.closeAllConnections();
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'the retroactive alert reads raw local storage, not the filtered view that has already hidden the version',
+    async () => {
+      const osv = await startMockOsvServer();
+      const client = makeFakeDynamoClient();
+      try {
+        await osv.setFixtureRecords([]);
+        osv.setCsvRows([]);
+        const logger = makeCapturingLogger();
+        const store = makeStore({baseUrl: osv.baseUrl}, client, {logger});
+        await bootstrapStore(store);
+
+        const registryStorage = makeFakeRegistryStorage();
+        registryStorage.setExisting('hidden-pkg', {
+          '1.0.0': {version: '1.0.0'},
+        });
+        registryStorage.filteredView('hidden-pkg', {}); // filter_metadata already removed it
+        store.attachRegistryStorage(registryStorage);
+
+        osv.setCsvEtag('etag-v2');
+        osv.setCsvRows([{modified: '2030-01-01T00:00:00Z', id: 'MAL-2030-9'}]);
+        osv.setRecord(
+          'MAL-2030-9',
+          makeOsvRecord({
+            id: 'MAL-2030-9',
+            modified: '2030-01-01T00:00:00Z',
+            packageName: 'hidden-pkg',
+          }),
+        );
+        await store.runSyncCycle();
+        assert.equal(logger.calls.fatal.length, 1);
+        assert.equal(logger.calls.fatal[0][0].ver, '1.0.0');
+      } finally {
+        osv.server.close();
+      }
+    },
+  );
+
+  await check(
+    'getCveAdvisories() charges a shared budget and throws ADVISORY_BUDGET once it is spent',
+    async () => {
+      const osv = await startMockOsvServer();
+      try {
+        await osv.setFixtureRecords([
+          makeGhsaRecord({
+            id: 'GHSA-aaaa-aaaa-aaaa',
+            modified: '2025-01-01T00:00:00Z',
+            packageName: 'cve-pkg',
+            fixed: '2.0.0',
+          }),
+        ]);
+        osv.setCsvRows([]);
+        const store = makeStore({baseUrl: osv.baseUrl}, makeFakeDynamoClient());
+        await bootstrapStore(store);
+        const budget = {remaining: 3};
+        assert.equal(
+          store.getCveAdvisories('cve-pkg', ['1.0.0', '1.1.0'], budget).length,
+          1,
+        );
+        assert.equal(budget.remaining, 1);
+        assert.throws(
+          () => store.getCveAdvisories('cve-pkg', ['1.0.0', '1.1.0'], budget),
+          err => err.code === 'ADVISORY_BUDGET',
+        );
+        // A package with no advisories costs nothing.
+        assert.deepEqual(
+          store.getCveAdvisories('clean-pkg', ['1.0.0'], {remaining: 0}),
+          [],
+        );
+      } finally {
+        osv.server.close();
+      }
     },
   );
 

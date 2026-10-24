@@ -62,15 +62,38 @@ function makeFakeStorage() {
       if (!existing) return callback({status: 404}, null);
       callback(null, existing);
     },
+    localStorage: {
+      getPackageMetadata(name, callback) {
+        const existing = existingByName.get(name);
+        if (!existing) return callback({status: 404, code: 404}, null);
+        callback(null, existing);
+      },
+    },
   };
 }
 
+// Stands in for Verdaccio's Auth#allow_publish: every request here comes
+// from a user allowed to publish (see test/smoke.js for the refusal paths).
+const ALLOW_ALL_AUTH = {
+  allow_publish(pkg, user, callback) {
+    callback(null, true);
+  },
+};
+const PUBLISHER = {name: 'tester', groups: ['$all', '$authenticated']};
+
+// register_middlewares() registers several app.use() handlers; this
+// dispatches through all of them in order, as Express would.
 async function startServer(instance, storage) {
-  let handler;
-  instance.register_middlewares({use: fn => (handler = fn)}, null, storage);
+  const handlers = [];
+  instance.register_middlewares(
+    {use: fn => handlers.push(fn)},
+    ALLOW_ALL_AUTH,
+    storage,
+  );
 
   const server = http.createServer((req, res) => {
     req.path = new URL(req.url, 'http://localhost').pathname;
+    req.remote_user = PUBLISHER;
     res.status = function (code) {
       this.statusCode = code;
       return this;
@@ -79,16 +102,21 @@ async function startServer(instance, storage) {
       this.setHeader('content-type', 'application/json');
       this.end(JSON.stringify(body));
     };
+    let index = 0;
     const next = err => {
       if (res.headersSent) return;
       if (err) {
         res.status(err.status || 500).json({error: err.message});
         return;
       }
-      res.status(201).json({ok: true});
+      const handler = handlers[index++];
+      if (!handler) {
+        res.status(201).json({ok: true});
+        return;
+      }
+      handler(req, res, next);
     };
-    if (!handler) return next();
-    handler(req, res, next);
+    next();
   });
 
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -308,6 +336,125 @@ async function main() {
         await waitFor(() => receiver.requests.length > 0);
       } finally {
         await receiver.close();
+      }
+    },
+  );
+
+  // --- substitution is escaped for where it lands; logs never carry the URL ---
+
+  const {sendWebhook} = require('../webhook.js');
+
+  async function waitForRequests(receiver, count) {
+    const deadline = Date.now() + 2000;
+    while (receiver.requests.length < count && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+
+  await check(
+    'a JSON body template stays valid JSON with the same fields, whatever a substituted value holds',
+    async () => {
+      const receiver = await startWebhookReceiver();
+      try {
+        const ver = '1.0.0","text":"<!channel> run curl x | sh","x":"\\';
+        sendWebhook(
+          {
+            url: `${receiver.url}/hook`,
+            body: '{"text":"{{pkg}}@{{ver}} blocked: {{reason}}"}',
+          },
+          {pkg: 'evil-pkg', ver, reason: 'line one\nline two\u0007'},
+        );
+        await waitForRequests(receiver, 1);
+        const payload = JSON.parse(receiver.requests[0].body);
+        assert.deepEqual(Object.keys(payload), ['text']);
+        assert.equal(
+          payload.text,
+          `evil-pkg@${ver} blocked: line oneline two`,
+          'control characters are removed, everything else is kept as text',
+        );
+      } finally {
+        await receiver.close();
+      }
+    },
+  );
+
+  await check(
+    'a substituted value is URL-encoded in the url, so it cannot add query parameters or a path',
+    async () => {
+      const receiver = await startWebhookReceiver();
+      try {
+        sendWebhook(
+          {url: `${receiver.url}/hook?pkg={{pkg}}&ver={{ver}}`},
+          {pkg: '@scope/pkg', ver: '1.0.0&admin=1#x'},
+        );
+        await waitForRequests(receiver, 1);
+        const url = new URL(receiver.requests[0].path, 'http://localhost');
+        assert.equal(url.pathname, '/hook');
+        assert.deepEqual([...url.searchParams.keys()], ['pkg', 'ver']);
+        assert.equal(url.searchParams.get('pkg'), '@scope/pkg');
+        assert.equal(url.searchParams.get('ver'), '1.0.0&admin=1#x');
+      } finally {
+        await receiver.close();
+      }
+    },
+  );
+
+  await check(
+    'a header value never carries a substituted CR or LF, and a non-JSON body is only stripped of control characters',
+    async () => {
+      const receiver = await startWebhookReceiver();
+      try {
+        sendWebhook(
+          {
+            url: `${receiver.url}/hook`,
+            body: 'pkg={{pkg}}',
+            'x-event': '{{ver}}',
+          },
+          {pkg: 'a"b', ver: '1.0.0\r\nx-injected: yes'},
+        );
+        await waitForRequests(receiver, 1);
+        const [request] = receiver.requests;
+        assert.equal(request.headers['x-event'], '1.0.0x-injected: yes');
+        assert.equal(request.headers['x-injected'], undefined);
+        assert.equal(request.body, 'pkg=a"b');
+      } finally {
+        await receiver.close();
+      }
+    },
+  );
+
+  await check(
+    'delivery failures and error responses log the host only, never the secret-bearing URL',
+    async () => {
+      const failing = http.createServer((req, res) => {
+        res.statusCode = 500;
+        res.end();
+      });
+      await new Promise(resolve => failing.listen(0, '127.0.0.1', resolve));
+      const logger = makeCapturingLogger();
+      try {
+        const port = failing.address().port;
+        sendWebhook(
+          {url: `http://127.0.0.1:${port}/services/T000/B000/SECRETTOKEN`},
+          {},
+          logger,
+        );
+        sendWebhook(
+          {url: 'http://127.0.0.1:1/services/T000/B000/SECRETTOKEN'},
+          {},
+          logger,
+        );
+        const deadline = Date.now() + 2000;
+        while (logger.calls.warn.length < 2 && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        assert.equal(logger.calls.warn.length, 2);
+        for (const [fields] of logger.calls.warn) {
+          assert.ok(!JSON.stringify(fields).includes('SECRETTOKEN'));
+          assert.match(fields.host, /^127\.0\.0\.1:\d+$/);
+        }
+      } finally {
+        failing.close();
       }
     },
   );
